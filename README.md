@@ -105,14 +105,6 @@ Even extensive gameplay mod settings are localized.
 
 ---
 
-### Additional Settings Pages
-
-<p align="center">
-<img src="assets/garage_settings.png" width="850"/>
-</p>
-
----
-
 ## How it Works
 
 1. Select a Cyberpunk mod ZIP.
