@@ -1,0 +1,36 @@
+CYBERPUNK 2077 UNIVERSAL MOD TRANSLATOR
+THIRD-PARTY SOFTWARE NOTICES
+
+WolvenKit Console 9.0.1
+------------------------
+Component: WolvenKit Console
+Version: 9.0.1
+License: GNU General Public License v3.0 (GPL-3.0)
+Official project: https://github.com/WolvenKit/WolvenKit
+Release: https://github.com/WolvenKit/WolvenKit/releases/tag/9.0.1
+
+This distribution includes WolvenKit Console 9.0.1 as an external,
+unmodified third-party component used for Cyberpunk 2077 archive/resource
+processing.
+
+Please keep the original license, copyright, notice, and attribution files
+shipped with the WolvenKit distribution inside the
+WolvenKit.Console-9.0.1 folder.
+
+Corresponding source for WolvenKit 9.0.1:
+https://github.com/WolvenKit/WolvenKit/tree/9.0.1
+
+The Cyberpunk 2077 Universal Mod Translator does not modify the bundled
+WolvenKit binaries.
+
+Other dependencies
+------------------
+The translator uses additional third-party Python/API components. Their own
+licenses and terms remain applicable. Release packaging should preserve any
+license or notice files shipped with those components.
+
+Game / trademark notice
+-----------------------
+Cyberpunk 2077 and REDengine are trademarks and/or proprietary technology of
+CD PROJEKT RED. Cyberpunk 2077 Universal Mod Translator is an independent
+community tool and is not affiliated with or endorsed by CD PROJEKT RED.

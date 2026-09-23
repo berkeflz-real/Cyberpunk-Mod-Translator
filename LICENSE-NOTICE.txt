@@ -1,0 +1,13 @@
+LICENSE NOTICE
+
+Cyberpunk 2077 Universal Mod Translator is distributed together with
+WolvenKit Console 9.0.1 as an external third-party component.
+
+WolvenKit Console 9.0.1 is licensed under the GNU General Public License
+version 3.0 (GPL-3.0).
+
+The original WolvenKit license and notice files must remain with the
+WolvenKit.Console-9.0.1 distribution folder.
+
+See THIRD-PARTY-NOTICES.txt for the official WolvenKit project, release,
+and corresponding-source links.
