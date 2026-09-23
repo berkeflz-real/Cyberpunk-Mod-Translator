@@ -19,6 +19,8 @@
 
 ---
 
+https://www.nexusmods.com/cyberpunk2077/mods/34239?tab=description
+
 ## What is this?
 
 Cyberpunk Mod Translator automatically translates Cyberpunk 2077 mods into your chosen language using Google's Gemini AI.
