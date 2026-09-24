@@ -13,6 +13,8 @@ from tkinter import filedialog, messagebox, ttk
 import translator
 
 # ============================================================
+VERSION = "1.0.3"
+
 # CONFIGURATION
 # ============================================================
 
@@ -97,8 +99,9 @@ UI_TEXT = {
             "Select a .archive or .zip mod, choose your target language, enter your Gemini API key, and start the translation.\n\n"
             "2. CRITICAL - GAME DISPLAY LANGUAGE:\n"
             "The in-game display language MUST MATCH the language you translated the mod into. For example, if you translated a mod to German, your game's display language must be set to German; otherwise, the translated text will not appear.\n\n"
-            "3. CRITICAL - LOAD ORDER (MO2 / VORTEX):\n"
-            "In your mod manager (MO2/Vortex), the translated mod package MUST be loaded AFTER (below) the original mod so its localization files can properly override the original ones.\n\n"
+            "3. INSTALLATION:\n"
+            "For a new installation, install ONLY the generated target-language ZIP. The generated ZIP is a complete replacement package; the original mod does not need to remain installed separately.\n\n"
+            "If the original mod is already installed and you do not want to remove/reinstall it, install the generated translation as a separate mod and place it AFTER (below) the original in MO2/Vortex so the translated files take priority.\n\n"
             "4. STABILITY & SAFETY:\n"
             "When a mod contains .archive files, the translator safely modifies only supported localization resources and leaves runtime script files (.reds, .lua, .tweak) untouched to reduce the risk of breaking the mod.\n\n"
             "5. MANUAL INSTALLATION:\n"
@@ -150,8 +153,9 @@ UI_TEXT = {
             ".archive veya .zip formatındaki modu seçin, hedef dili belirleyin, Gemini API anahtarınızı girin ve çeviriyi başlatın.\n\n"
             "2. ÇOK ÖNEMLİ - OYUNUN GÖRÜNTÜLEME DİLİ:\n"
             "Oyunun görüntüleme dili, modu çevirdiğiniz dille KESİNLİKLE aynı OLMALIDIR. Örneğin bir modu Almancaya çevirdiyseniz, oyunun görüntüleme dili de Almanca olmalıdır; aksi halde çevrilen metinler görünmez.\n\n"
-            "3. ÇOK ÖNEMLİ - YÜKLEME SIRASI (MO2 / VORTEX):\n"
-            "Mod yöneticinizde (MO2/Vortex) oluşturulan çeviri modu, orijinal modun ALTINDA yer almalıdır. Yerelleştirme dosyalarının orijinal dosyaların üzerine yazabilmesi için çeviri moduna öncelik verilmelidir.\n\n"
+            "3. KURULUM:\n"
+            "Yeni bir kurulumda yalnızca oluşturulan hedef dil ZIP dosyasını MO2/Vortex'e kurun. Oluşturulan ZIP, modun tam çevrilmiş/değiştirilmiş paketidir; orijinal modun ayrıca kurulu kalmasına gerek yoktur.\n\n"
+            "Orijinal mod zaten kuruluysa ve kaldırıp yeniden kurmak istemiyorsanız, oluşturulan çeviriyi ayrı bir mod olarak ekleyin ve MO2/Vortex'te orijinal modun ALTINDA yerleştirin. Böylece çeviri dosyaları öncelik kazanır.\n\n"
             "4. GÜVENLİK VE KARARLILIK:\n"
             "Modun içinde .archive dosyaları varsa, yalnızca desteklenen yerelleştirme kaynakları güvenli şekilde işlenir; çalışma zamanı kod dosyalarına (.reds, .lua, .tweak) dokunulmaz.\n\n"
             "5. MANUEL KURULUM:\n"
@@ -238,12 +242,18 @@ def run_command(command, log_func):
 # ARCHIVE / ZIP DISCOVERY
 # ============================================================
 
+
+# ============================================================
+# ARCHIVE / ZIP DISCOVERY
+# ============================================================
+
 def archive_is_cr2w(path):
     try:
         with open(path, "rb") as f:
             return f.read(4) == b"CR2W"
     except Exception:
         return False
+
 
 def discover_archives(root):
     root = Path(root)
@@ -252,95 +262,133 @@ def discover_archives(root):
         key=lambda p: str(p).lower(),
     )
 
+KNOWN_LOCALE_CODES = {code.lower() for code, _ in LANGUAGES.values()}
+JSON_LOCALIZATION_HINTS = (
+    "translation",
+    "localization",
+    "strings",
+    "onscreen",
+    "subtitle",
+    "journal",
+)
+
+
 def path_has_localization_locale(path, source_code=SOURCE_CODE):
-    """Return True when a path contains a supported localization surface and source locale."""
-    parts = [p.lower() for p in Path(path).parts]
-    source_code = source_code.lower()
+    parts = [part.lower() for part in Path(path).parts]
+    if "localization" not in parts:
+        return False
+    loc_index = parts.index("localization")
+    return source_code.lower() in parts[loc_index + 1 :]
 
-    for surface in ("localization", "onscreens"):
-        if surface not in parts:
-            continue
-        try:
-            surface_index = parts.index(surface)
-        except ValueError:
-            continue
-        after = parts[surface_index + 1:]
-        if source_code in after:
+
+def json_filename_has_localization_hint(path):
+    name = Path(path).name.lower()
+    return any(hint in name for hint in JSON_LOCALIZATION_HINTS)
+
+
+def resource_has_source_locale(path, source_code=SOURCE_CODE):
+    parts = [part.lower() for part in Path(path).parts]
+    source = source_code.lower()
+    if source in parts:
+        return True
+    name = Path(path).name.lower()
+    return name in {f"{source}.json", f"{source}.json.json"}
+
+
+def resource_has_other_known_locale(path, source_code=SOURCE_CODE):
+    source = source_code.lower()
+    for part in Path(path).parts:
+        lower = part.lower()
+        if lower in KNOWN_LOCALE_CODES and lower != source:
             return True
-
     return False
 
+
 def discover_localization_resources(extracted_root):
-    extracted_root = Path(extracted_root)
+    root = Path(extracted_root)
     resources = []
-
-    for path in extracted_root.rglob("*.json"):
-        if not path.is_file():
+    for path in root.rglob("*.json"):
+        if not path.is_file() or not archive_is_cr2w(path):
             continue
 
-        lower_parts = [p.lower() for p in path.relative_to(extracted_root).parts]
-        candidate = (
-            path.name.lower() == "en-us.json"
-            or path_has_localization_locale(path, SOURCE_CODE)
-        )
-
-        # ArchiveXL OnScreen resources are CR2W JsonResource files stored under
-        # <...>/onscreens/en-us/*.json. They must be serialized by WolvenKit
-        # before the existing Gemini translation pipeline can process them.
-        if "onscreens" in lower_parts:
-            candidate = candidate and SOURCE_CODE.lower() in lower_parts[lower_parts.index("onscreens") + 1:]
-
-        if not candidate:
+        if resource_has_other_known_locale(path):
+            # We always translate the English source locale. Other language
+            # copies stay untouched.
             continue
 
-        if not archive_is_cr2w(path):
+        source_path = resource_has_source_locale(path, SOURCE_CODE)
+        filename_hint = json_filename_has_localization_hint(path)
+        if not source_path and not filename_hint:
             continue
 
         resources.append(path)
 
-    unique = {str(p).lower(): p for p in resources}
-    return sorted(
-        unique.values(),
-        key=lambda p: str(p).lower(),
-    )
+    unique = {str(path).lower(): path for path in resources}
+    return sorted(unique.values(), key=lambda p: str(p).lower())
+
+
+def _walk_json_objects(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_json_objects(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_json_objects(child)
+
+
+def is_localization_json_schema(filepath):
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return False
+
+    if not (
+        isinstance(data, dict)
+        and isinstance(data.get("Data"), dict)
+        and isinstance(data["Data"].get("RootChunk"), dict)
+    ):
+        return False
+
+    for obj in _walk_json_objects(data):
+        obj_type = str(obj.get("$type", "")).lower()
+        has_variants = "femaleVariant" in obj or "maleVariant" in obj
+        if (
+            "localizationpersistence" in obj_type
+            and "secondaryKey" in obj
+            and has_variants
+        ):
+            return True
+        if "secondaryKey" in obj and has_variants:
+            return True
+    return False
 
 # ============================================================
-# ARCHIVEXL DISCOVERY / GENERATION
+# ARCHIVEXL
 # ============================================================
 
 def find_source_xl(search_root, archive_path, source_resource_paths):
     root = Path(search_root)
     archive_stem = Path(archive_path).stem.lower()
-
-    resources_text = []
+    resource_texts = []
     for resource in source_resource_paths:
         try:
-            resources_text.append(
+            resource_texts.append(
                 str(resource.relative_to(root)).replace("/", "\\").lower()
             )
         except ValueError:
-            resources_text.append(resource.name.lower())
-
-    candidates = sorted(
-        root.rglob("*.xl"),
-        key=lambda p: str(p).lower(),
-    )
+            resource_texts.append(resource.name.lower())
 
     best = None
-    best_score = -1
-
-    for candidate in candidates:
+    best_score = 0
+    for candidate in sorted(root.rglob("*.xl"), key=lambda p: str(p).lower()):
         try:
-            content = candidate.read_text(
-                encoding="utf-8",
-                errors="ignore",
-            )
+            content = candidate.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             continue
-
         lower = content.lower()
         score = 0
-
         if archive_stem in candidate.stem.lower():
             score += 5
         if archive_stem in lower:
@@ -349,139 +397,132 @@ def find_source_xl(search_root, archive_path, source_resource_paths):
             score += 2
         if "en-us:" in lower:
             score += 2
-
-        for resource_text in resources_text:
+        for resource_text in resource_texts:
             if resource_text and resource_text in lower:
                 score += 4
-
         if score > best_score:
             best_score = score
             best = candidate
+    return best
 
-    return best if best_score > 0 else None
 
 def replace_locale_in_text(text, source_code, target_code):
-    text = re.sub(
-        rf"(?i)(?<=/){re.escape(source_code)}(?=/)",
-        target_code,
-        text,
-    )
-    text = re.sub(
-        rf"(?i)(?<=\\){re.escape(source_code)}(?=\\)",
-        target_code,
-        text,
-    )
-    text = re.sub(
-        rf"(?i)(^|\s){re.escape(source_code)}(?=\s*:)",
-        lambda m: f"{m.group(1)}{target_code}",
-        text,
-        flags=re.MULTILINE,
-    )
-    text = re.sub(
+    return re.sub(
         rf"(?i)\b{re.escape(source_code)}\b",
         target_code,
         text,
     )
-    return text
 
-def infer_localization_category(resource, extracted_root):
-    parts = [p for p in resource.relative_to(extracted_root).parts]
-    lower = [p.lower() for p in parts]
-
-    if "localization" in lower:
-        idx = lower.index("localization")
-        after = lower[idx + 1:]
-        if SOURCE_CODE in after:
-            lang_idx = after.index(SOURCE_CODE)
-            if lang_idx + 1 < len(after):
-                category = after[lang_idx + 1]
-                if category:
-                    return category
-
-    if "onscreens" in lower:
-        return "onscreens"
-
-    return "onscreens"
-
-def generate_xl_from_resources(resources, extracted_root, target_code):
-    groups = {}
-
-    for resource in resources:
-        relative_target = target_path_for_resource(
-            resource,
-            extracted_root,
-            target_code,
-        )
-        category = infer_localization_category(
-            resource,
-            extracted_root,
-        )
-        windows_path = str(relative_target).replace("/", "\\")
-        groups.setdefault(category, []).append(windows_path)
-
-    lines = ["localization:"]
-
-    for category in sorted(groups):
-        lines.append(f"  {category}:")
-        lines.append(f"    {target_code}:")
-        for value in groups[category]:
-            lines.append(f"      - {value}")
-
-    return "\n".join(lines) + "\n"
 
 def target_path_for_resource(resource, extracted_root, target_code):
     relative = resource.relative_to(extracted_root)
     parts = list(relative.parts)
-    lower = [p.lower() for p in parts]
+    source = SOURCE_CODE.lower()
+    for index, part in enumerate(parts):
+        if part.lower() == source:
+            parts[index] = target_code
+            return Path(*parts)
 
-    for surface in ("localization", "onscreens"):
-        if surface not in lower:
+    lower_name = relative.name.lower()
+    if lower_name in {f"{source}.json", f"{source}.json.json"}:
+        return relative.with_name(re.sub(re.escape(source), target_code, relative.name, count=1, flags=re.I))
+
+    # Locale-less resources such as translation_strings.json are consumed at
+    # their original path and must be replaced in place.
+    return relative
+
+
+def _language_mapping_blocks(lines):
+    language_re = re.compile(
+        r"^(?P<indent>[ \t]*)(?P<lang>[a-z]{2}-[a-z]{2})(?P<sep>\s*:\s*)(?P<value>.*?)(?P<nl>\r?\n)?$",
+        re.I,
+    )
+    blocks = []
+    i = 0
+    while i < len(lines):
+        match = language_re.match(lines[i])
+        if not match:
+            i += 1
             continue
-        surface_index = lower.index(surface)
-        for i in range(surface_index + 1, len(parts)):
-            if lower[i] == SOURCE_CODE.lower():
-                parts[i] = target_code
-                return Path(*parts)
+        indent = len(match.group("indent").replace("\t", "    "))
+        start = i
+        i += 1
+        while i < len(lines):
+            next_match = language_re.match(lines[i])
+            if next_match and len(next_match.group("indent").replace("\t", "    ")) <= indent:
+                break
+            # Stop at another obvious top-level YAML section if it is at or
+            # above the mapping indentation.
+            if lines[i].strip() and len(lines[i]) - len(lines[i].lstrip(" \t")) <= indent and ":" in lines[i]:
+                break
+            i += 1
+        blocks.append((start, i, match, indent))
+    return blocks
 
-    if relative.name.lower() == "en-us.json":
-        return relative.with_name(f"{target_code}.json")
 
-    return relative.with_name(
-        relative.name.replace(SOURCE_CODE, target_code)
-    )
+def transform_archive_xl(content, source_code, target_code):
+    if source_code.lower() == target_code.lower():
+        return content
 
-def build_target_xl(
-    source_xl,
-    target_code,
-    output_xl,
-    resources,
-    extracted_root,
-):
-    if source_xl is not None:
-        try:
-            content = source_xl.read_text(
-                encoding="utf-8",
-                errors="ignore",
-            )
-            transformed = replace_locale_in_text(
-                content,
-                SOURCE_CODE,
-                target_code,
-            )
-            output_xl.write_text(transformed, encoding="utf-8")
-            return
-        except Exception:
-            pass
+    lines = content.splitlines(keepends=True)
+    blocks = _language_mapping_blocks(lines)
+    source_blocks = [block for block in blocks if block[2].group("lang").lower() == source_code.lower()]
+    if not source_blocks:
+        return content
 
-    generated = generate_xl_from_resources(
-        resources,
-        extracted_root,
-        target_code,
-    )
-    output_xl.write_text(generated, encoding="utf-8")
+    target_lower = target_code.lower()
+    remove_ranges = []
+    for start, end, match, _ in blocks:
+        if match.group("lang").lower() == target_lower:
+            remove_ranges.append((start, end))
+
+    remove_set = set()
+    for start, end in remove_ranges:
+        remove_set.update(range(start, end))
+
+    result = []
+    source_block_ranges = {(start, end) for start, end, _, _ in source_blocks}
+    i = 0
+    while i < len(lines):
+        if i in remove_set:
+            i += 1
+            continue
+
+        block = next((b for b in source_blocks if b[0] == i), None)
+        if block:
+            start, end, match, _ = block
+            for j in range(start, end):
+                result.append(replace_locale_in_text(lines[j], source_code, target_code))
+            i = end
+            continue
+
+        result.append(lines[i])
+        i += 1
+
+    return "".join(result)
+
+
+def build_target_xl(source_xl, target_code, output_xl):
+    if source_xl is None:
+        return False
+    try:
+        original = source_xl.read_text(encoding="utf-8", errors="ignore")
+        # Some ArchiveXL manifests map locale-less resources (for example
+        # translation_strings.json) without an en-us language block. In that
+        # case the manifest itself must be preserved unchanged because the
+        # translated resource stays at the same path.
+        if not re.search(r"(?im)^\s*en-us\s*:", original):
+            output_xl.write_text(original, encoding="utf-8")
+            return True
+
+        transformed = transform_archive_xl(original, SOURCE_CODE, target_code)
+        output_xl.write_text(transformed, encoding="utf-8")
+        return True
+    except Exception:
+        return False
 
 # ============================================================
-# OUTPUT NAMING / ZIP
+# OUTPUT / TRANSLATOR BRIDGE
 # ============================================================
 
 def clean_archive_stem(stem):
@@ -492,28 +533,24 @@ def clean_archive_stem(stem):
         flags=re.IGNORECASE,
     )
 
+
 def make_unique_base(base, used):
     if base not in used:
         used.add(base)
         return base
+    number = 2
+    while f"{base}_{number}" in used:
+        number += 1
+    result = f"{base}_{number}"
+    used.add(result)
+    return result
 
-    n = 2
-    while f"{base}_{n}" in used:
-        n += 1
-
-    final = f"{base}_{n}"
-    used.add(final)
-    return final
 
 def package_is_safe_mod_zip(zip_path):
     with zipfile.ZipFile(zip_path, "r") as z:
         names = {name.replace("\\", "/") for name in z.namelist()}
-
     return any(name.startswith("archive/pc/mod/") for name in names)
 
-# ============================================================
-# TRANSLATOR BRIDGE
-# ============================================================
 
 def run_translator(
     serialized_json,
@@ -527,23 +564,23 @@ def run_translator(
 ):
     translated_root = Path(translated_root)
     translated_root.mkdir(parents=True, exist_ok=True)
-
     output_file = translated_root / target_name
     terminology_file = translated_root / "terminology.json"
     checkpoint_file = translated_root / "checkpoint.json"
-
-    if terminology_seed is not None:
+    if terminology_seed is not None and Path(terminology_seed).exists() and not terminology_file.exists():
         shutil.copy2(terminology_seed, terminology_file)
 
     old_values = {
-        "INPUT_FILE": translator.INPUT_FILE,
-        "OUTPUT_FILE": translator.OUTPUT_FILE,
-        "TERMINOLOGY_FILE": translator.TERMINOLOGY_FILE,
-        "CHECKPOINT_FILE": translator.CHECKPOINT_FILE,
-        "TARGET_LANGUAGE": translator.TARGET_LANGUAGE,
-        "TARGET_CODE": translator.TARGET_CODE,
+        name: getattr(translator, name)
+        for name in (
+            "INPUT_FILE",
+            "OUTPUT_FILE",
+            "TERMINOLOGY_FILE",
+            "CHECKPOINT_FILE",
+            "TARGET_LANGUAGE",
+            "TARGET_CODE",
+        )
     }
-    
     old_env = os.environ.get("GEMINI_API_KEY")
     old_stdout = sys.stdout
 
@@ -557,9 +594,10 @@ def run_translator(
 
     class LogWriter:
         def write(self, text):
-            text = text.strip()
             if text and log_func:
-                log_func(text)
+                stripped = text.strip()
+                if stripped:
+                    log_func(stripped)
             return len(text)
 
         def flush(self):
@@ -570,45 +608,36 @@ def run_translator(
         translator.main()
     finally:
         sys.stdout = old_stdout
-
-        for key, value in old_values.items():
-            setattr(translator, key, value)
-
+        for name, value in old_values.items():
+            setattr(translator, name, value)
         if old_env is None:
             os.environ.pop("GEMINI_API_KEY", None)
         else:
             os.environ["GEMINI_API_KEY"] = old_env
 
     if not output_file.exists():
-        raise RuntimeError(f"Translator completed without creating {target_name}.")
-
+        raise RuntimeError(
+            f"Translator completed without creating {target_name}."
+        )
     return output_file
 
+
 def process_selective_lua_localization(stage_root, client, terminology_file, log_func):
-    """Translate only recognized Lua localization surfaces; never use generic Lua string replacement."""
-    root = Path(stage_root)
     translated = []
     failures = []
-
-    candidates = sorted(root.rglob("*.lua"), key=lambda p: str(p).lower())
-    for path in candidates:
+    for path in sorted(Path(stage_root).rglob("*.lua"), key=lambda p: str(p).lower()):
         try:
             if not translator.is_lua_localization_file(path):
                 continue
             terminology = translator.load_terminology()
-            ok = translator.translate_lua_localization_file(
-                client,
-                str(path),
-                terminology,
-                log_func,
-            )
-            if ok:
+            if translator.translate_lua_localization_file(
+                client, str(path), terminology, log_func
+            ):
                 translated.append(path)
-        except Exception as e:
-            warning = f"Lua localization failed for {path.name}: {e}"
+        except Exception as error:
+            warning = f"Lua localization failed for {path.name}: {error}"
             failures.append(warning)
             log_func(f"WARNING: {warning}")
-
     return translated, failures
 
 # ============================================================
@@ -629,430 +658,416 @@ def run_translation(
 
     target_code, target_language = LANGUAGES[selected_language]
     target_short = target_code.split("-")[0].upper()
-    clean_input_stem = clean_archive_stem(input_path.stem)
-
-    work_root = output_folder / "_cytranslator_work"
-    if work_root.exists():
-        shutil.rmtree(work_root, ignore_errors=True)
+    clean_stem = clean_archive_stem(input_path.stem)
+    job_id = f"{clean_stem}_{target_code}"
+    work_root = output_folder / "_cytranslator_work" / job_id
     work_root.mkdir(parents=True, exist_ok=True)
 
     stage_root = work_root / "MO2"
     mod_root = stage_root / "archive" / "pc" / "mod"
     mod_root.mkdir(parents=True, exist_ok=True)
+    shared_terms = work_root / "terminology.json"
+    if not shared_terms.exists():
+        shared_terms.write_text(
+            json.dumps({"languages": {}}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
-    used_output_names = set()
-    produced_archives = []
-    produced_xls = []
     translation_warnings = []
+    used_output_names = set()
 
     try:
-        # ----------------------------------------------------
-        # INPUT PREPARATION
-        # ----------------------------------------------------
+        source_root = work_root / "source"
         if input_path.suffix.lower() == ".zip":
-            source_root = work_root / "source"
+            # Refresh only source/stage. Resource checkpoints and translated outputs
+            # live separately and survive restarts.
+            if source_root.exists():
+                shutil.rmtree(source_root, ignore_errors=True)
+            if stage_root.exists():
+                shutil.rmtree(stage_root, ignore_errors=True)
             source_root.mkdir(parents=True, exist_ok=True)
-
             log_func(f"Unpacking source ZIP: {input_path.name}")
             with zipfile.ZipFile(input_path, "r") as z:
                 z.extractall(source_root)
-
             shutil.copytree(source_root, stage_root, dirs_exist_ok=True)
             archives = discover_archives(source_root)
         else:
-            source_root = work_root / "source"
+            if stage_root.exists():
+                shutil.rmtree(stage_root, ignore_errors=True)
             source_root.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(input_path, source_root / input_path.name)
+            stage_root.mkdir(parents=True, exist_ok=True)
+            mod_root.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(input_path, mod_root / input_path.name)
             archives = [input_path]
 
-        # ----------------------------------------------------
-        # TRANSLATION STATE SHARED ACROSS RESOURCES
-        # ----------------------------------------------------
-        shared_terms = work_root / "terminology.json"
-        if not shared_terms.exists():
-            shared_terms.write_text(
-                json.dumps({"languages": {}}, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-
-        # ----------------------------------------------------
-        # ARCHIVE BRANCH
-        # ----------------------------------------------------
         if archives:
             log_func(f"Found {len(archives)} archive file(s).")
-            log_func("Safety mode: runtime .reds/.lua/.tweak files are protected. Dedicated localization surfaces, including ArchiveXL OnScreen resources, may still be processed safely.")
-            
-            for archive_index, archive_path in enumerate(archives, start=1):
+            log_func(
+                "Safety mode: runtime .reds/.lua/.tweak files are protected. "
+                "Dedicated localization surfaces, including ArchiveXL OnScreen resources, may still be processed safely."
+            )
+
+            from google import genai
+            client = genai.Client(api_key=api_key)
+
+            for archive_index, archive_path in enumerate(archives, 1):
                 log_func("")
-                log_func(f"=== ARCHIVE {archive_index}/{len(archives)}: {archive_path.name} ===")
+                log_func(
+                    f"=== ARCHIVE {archive_index}/{len(archives)}: {archive_path.name} ==="
+                )
 
                 archive_work = work_root / f"archive_{archive_index}"
-                extracted_root = archive_work / "extracted"
-                serialized_root = archive_work / "serialized"
-                translated_root = archive_work / "translated"
-                deserialized_root = archive_work / "deserialized"
-                pack_root = archive_work / "pack"
-                packed_root = archive_work / "packed"
-
-                for folder in [
-                    extracted_root, serialized_root, translated_root,
-                    deserialized_root, pack_root, packed_root,
-                ]:
-                    folder.mkdir(parents=True, exist_ok=True)
+                extracted = archive_work / "extracted"
+                pack = archive_work / "pack"
+                packed = archive_work / "packed"
+                for directory in (extracted, pack, packed):
+                    if directory.exists():
+                        shutil.rmtree(directory, ignore_errors=True)
+                    directory.mkdir(parents=True, exist_ok=True)
 
                 run_command(
-                    [str(WOLVENKIT), "extract", str(archive_path), "-o", str(extracted_root)],
+                    [str(WOLVENKIT), "extract", str(archive_path), "-o", str(extracted)],
                     log_func,
                 )
+                resources = discover_localization_resources(extracted)
+                if resources:
+                    log_func(
+                        f"Found {len(resources)} localization candidate(s) in source-language resources."
+                    )
+                else:
+                    log_func(
+                        "INFO: No localization candidates found in this archive; archive will be copied unchanged."
+                    )
 
-                resources = discover_localization_resources(extracted_root)
-
-                if not resources:
-                    log_func("INFO: No supported localization resources found in this archive; archive will be copied unchanged.")
-                    continue
-
-                onscreen_count = sum(
-                    1 for resource in resources
-                    if "onscreens" in [p.lower() for p in resource.relative_to(extracted_root).parts]
+                source_xl = (
+                    find_source_xl(source_root, archive_path, resources)
+                    if resources and input_path.suffix.lower() == ".zip"
+                    else None
                 )
-                log_func(f"Found {len(resources)} supported localization resource(s).")
-                if onscreen_count:
-                    log_func(f"ArchiveXL OnScreen localization detected: {onscreen_count} resource(s).")
-
-                xl_search_root = source_root if input_path.suffix.lower() == ".zip" else archive_path.parent
-                source_xl = find_source_xl(xl_search_root, archive_path, resources)
-
                 if source_xl:
                     log_func(f"Source ArchiveXL file: {source_xl}")
 
-                shutil.copytree(extracted_root, pack_root, dirs_exist_ok=True)
+                shutil.copytree(extracted, pack, dirs_exist_ok=True)
+                successful_resources = 0
 
-                for resource in resources:
-                    source_copy = pack_root / resource.relative_to(extracted_root)
-                    if source_copy.exists():
-                        source_copy.unlink()
+                for resource_index, resource in enumerate(resources, 1):
+                    relative_source = resource.relative_to(extracted)
+                    relative_target = target_path_for_resource(
+                        resource, extracted, target_code
+                    )
+                    resource_work = archive_work / "resources" / str(resource_index)
+                    serialized_root = resource_work / "serialized"
+                    translated_root = resource_work / "translated"
+                    deserialized_root = resource_work / "deserialized"
+                    for directory in (
+                        serialized_root,
+                        translated_root,
+                        deserialized_root,
+                    ):
+                        directory.mkdir(parents=True, exist_ok=True)
 
-                resource_counter = 0
-                for resource in resources:
-                    resource_counter += 1
-                    relative_source = resource.relative_to(extracted_root)
-                    relative_target = target_path_for_resource(resource, extracted_root, target_code)
-
-                    resource_work = archive_work / "resources" / str(resource_counter)
-                    resource_serialized = resource_work / "serialized"
-                    resource_translated = resource_work / "translated"
-                    resource_deserialized = resource_work / "deserialized"
-
-                    for folder in [resource_serialized, resource_translated, resource_deserialized]:
-                        folder.mkdir(parents=True, exist_ok=True)
-
-                    resource_parts_lower = [p.lower() for p in relative_source.parts]
-                    if "onscreens" in resource_parts_lower:
-                        log_func(f"OnScreen localization {resource_counter}/{len(resources)}: {relative_source}")
+                    lower_parts = [part.lower() for part in relative_source.parts]
+                    if "onscreens" in lower_parts:
+                        label = "OnScreen localization"
+                    elif json_filename_has_localization_hint(resource):
+                        label = "Localization candidate by filename"
                     else:
-                        log_func(f"Localization {resource_counter}/{len(resources)}: {relative_source}")
-
-                    run_command(
-                        [str(WOLVENKIT), "convert", "serialize", str(resource), "-o", str(resource_serialized)],
-                        log_func,
+                        label = "Localization"
+                    log_func(
+                        f"{label} {resource_index}/{len(resources)}: {relative_source}"
                     )
 
-                    candidates = list(resource_serialized.rglob("*.json.json"))
-                    if not candidates:
-                        candidates = list(resource_serialized.rglob("*.json"))
+                    run_command(
+                        [
+                            str(WOLVENKIT),
+                            "convert",
+                            "serialize",
+                            str(resource),
+                            "-o",
+                            str(serialized_root),
+                        ],
+                        log_func,
+                    )
+                    serialized_candidates = list(serialized_root.rglob("*.json.json"))
+                    if not serialized_candidates:
+                        serialized_candidates = list(serialized_root.rglob("*.json"))
+                    if not serialized_candidates:
+                        raise RuntimeError(
+                            f"Serialize produced no JSON for {relative_source}."
+                        )
+                    serialized_json = serialized_candidates[0]
 
-                    if not candidates:
-                        raise RuntimeError(f"Serialize produced no JSON for {resource}.")
-
-                    serialized_json = candidates[0]
-                    target_json_name = relative_target.name
-
-                    resource_terms = resource_translated / "terminology.json"
-                    shutil.copy2(shared_terms, resource_terms)
+                    if not is_localization_json_schema(serialized_json):
+                        log_func(
+                            "INFO: JSON candidate did not match the supported localization schema; "
+                            "original resource will be preserved unchanged."
+                        )
+                        continue
+                    log_func("  -> Supported localization schema confirmed.")
 
                     translated_json = run_translator(
-                        serialized_json=serialized_json,
-                        translated_root=resource_translated,
-                        target_name=target_json_name,
-                        api_key=api_key,
-                        target_code=target_code,
-                        target_language=target_language,
-                        terminology_seed=shared_terms,
-                        log_func=log_func,
+                        serialized_json,
+                        translated_root,
+                        relative_target.name,
+                        api_key,
+                        target_code,
+                        target_language,
+                        shared_terms,
+                        log_func,
                     )
-
-                    if resource_terms.exists():
-                        shutil.copy2(resource_terms, shared_terms)
-
                     run_command(
-                        [str(WOLVENKIT), "convert", "deserialize", str(translated_json), "-o", str(resource_deserialized)],
+                        [
+                            str(WOLVENKIT),
+                            "convert",
+                            "deserialize",
+                            str(translated_json),
+                            "-o",
+                            str(deserialized_root),
+                        ],
                         log_func,
                     )
 
-                    cr2w_candidates = list(resource_deserialized.rglob(Path(target_json_name).stem))
+                    cr2w_candidates = [
+                        p for p in deserialized_root.rglob("*")
+                        if p.is_file() and archive_is_cr2w(p)
+                    ]
                     if not cr2w_candidates:
-                        cr2w_candidates = [p for p in resource_deserialized.rglob("*") if archive_is_cr2w(p)]
-
-                    if not cr2w_candidates:
-                        raise RuntimeError(f"Deserialize produced no CR2W for {resource}.")
-
+                        raise RuntimeError(
+                            f"Deserialize produced no CR2W for {relative_source}."
+                        )
                     translated_cr2w = cr2w_candidates[0]
 
-                    pack_target = pack_root / relative_target
-                    pack_target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(translated_cr2w, pack_target)
+                    source_copy = pack / relative_source
+                    target_copy = pack / relative_target
+                    if source_copy.exists() and source_copy != target_copy:
+                        source_copy.unlink()
+                    target_copy.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(translated_cr2w, target_copy)
+                    successful_resources += 1
 
-                run_command(
-                    [str(WOLVENKIT), "pack", str(pack_root), "-o", str(packed_root)],
-                    log_func,
-                )
-
-                pack_candidates = list(packed_root.rglob("*.archive"))
-                if not pack_candidates:
-                    raise RuntimeError(f"WolvenKit produced no archive for {archive_path.name}.")
-
-                if len(pack_candidates) > 1:
-                    exact = packed_root / "pack.archive"
-                    if exact.exists():
-                        packed_archive = exact
-                    else:
-                        raise RuntimeError(f"Multiple archive outputs produced for {archive_path.name}.")
-                else:
-                    packed_archive = pack_candidates[0]
-
-                final_base = make_unique_base(f"{clean_archive_stem(archive_path.stem)}_{target_short}", used_output_names)
-                final_archive = mod_root / f"{final_base}.archive"
-                final_xl = mod_root / f"{final_base}.archive.xl"
-
-                shutil.copy2(packed_archive, final_archive)
-
-                build_target_xl(
-                    source_xl=source_xl,
-                    target_code=target_code,
-                    output_xl=final_xl,
-                    resources=resources,
-                    extracted_root=extracted_root,
-                )
-
-                produced_archives.append(final_archive)
-                produced_xls.append(final_xl)
-
-                if input_path.suffix.lower() == ".zip":
+                # Codeware fallback: translate the English package in place.
+                codeware_packages = [
+                    p
+                    for p in extracted.rglob("*.reds")
+                    if p.is_file() and translator.is_codeware_package_file(p)
+                ]
+                codeware_changed = False
+                if codeware_packages:
+                    old_values = (
+                        translator.TARGET_LANGUAGE,
+                        translator.TARGET_CODE,
+                        translator.TERMINOLOGY_FILE,
+                        translator.CHECKPOINT_FILE,
+                    )
+                    translator.TARGET_LANGUAGE = target_language
+                    translator.TARGET_CODE = target_code
+                    translator.TERMINOLOGY_FILE = str(shared_terms)
+                    translator.CHECKPOINT_FILE = str(
+                        work_root / "codeware_checkpoint.json"
+                    )
                     try:
-                        original_in_stage = stage_root / archive_path.relative_to(source_root)
-                    except ValueError:
-                        original_in_stage = None
+                        for package in codeware_packages:
+                            relative = package.relative_to(extracted)
+                            output_package = pack / relative
+                            log_func(
+                                f"Codeware localization fallback: translating the English package in place."
+                            )
+                            changed = translator.translate_codeware_package(
+                                client,
+                                str(package),
+                                str(output_package),
+                                translator.load_terminology(),
+                                "English",
+                                log_func,
+                            )
+                            codeware_changed = codeware_changed or bool(changed)
+                    finally:
+                        (
+                            translator.TARGET_LANGUAGE,
+                            translator.TARGET_CODE,
+                            translator.TERMINOLOGY_FILE,
+                            translator.CHECKPOINT_FILE,
+                        ) = old_values
 
-                    if original_in_stage and original_in_stage.exists():
-                        original_in_stage.unlink()
+                if successful_resources or codeware_changed:
+                    run_command(
+                        [
+                            str(WOLVENKIT),
+                            "pack",
+                            str(pack),
+                            "-o",
+                            str(packed),
+                        ],
+                        log_func,
+                    )
+                    pack_candidates = list(packed.rglob("*.archive"))
+                    if not pack_candidates:
+                        raise RuntimeError(
+                            f"WolvenKit produced no archive for {archive_path.name}."
+                        )
+                    packed_archive = next(
+                        (p for p in pack_candidates if p.name.lower() == "pack.archive"),
+                        pack_candidates[0],
+                    )
 
-                    for xl in stage_root.rglob("*.xl"):
-                        if xl in produced_xls:
-                            continue
-                        try:
-                            content = xl.read_text(encoding="utf-8", errors="ignore").lower()
-                        except Exception:
-                            continue
+                    final_base = make_unique_base(
+                        f"{clean_archive_stem(archive_path.stem)}_{target_short}",
+                        used_output_names,
+                    )
+                    final_archive = mod_root / f"{final_base}.archive"
+                    shutil.copy2(packed_archive, final_archive)
 
-                        if archive_path.stem.lower() in content or any(resource.name.lower() in content for resource in resources):
+                    final_xl = mod_root / f"{final_base}.archive.xl"
+                    if build_target_xl(source_xl, target_code, final_xl):
+                        pass
+                    elif final_xl.exists():
+                        final_xl.unlink()
+
+                    if input_path.suffix.lower() == ".zip":
+                        staged_original = stage_root / archive_path.relative_to(source_root)
+                        if staged_original.exists():
+                            staged_original.unlink()
+                        if source_xl is not None:
                             try:
-                                xl.unlink()
-                            except Exception:
+                                staged_xl = stage_root / source_xl.relative_to(source_root)
+                                if staged_xl.exists():
+                                    staged_xl.unlink()
+                            except ValueError:
                                 pass
+                else:
+                    log_func("INFO: No supported localization changes were produced; original archive retained.")
 
-        # ----------------------------------------------------
-        # OPEN-FILE BRANCH: only when there is NO ARCHIVE
-        # ----------------------------------------------------
         else:
+            # Loose/open-file mode: process only dedicated, safe surfaces.
             log_func("No .archive files found. Open-file translation mode is enabled.")
-
-            open_files = list(stage_root.rglob("*"))
-            code_files = [
-                p for p in open_files
-                if p.is_file() and p.suffix.lower() in {".lua", ".yaml", ".tweak", ".json", ".reds", ".txt"}
-            ]
-
-            codeware_packages = [p for p in code_files if translator.is_codeware_package_file(p)]
-            codeware_providers = [p for p in code_files if translator.is_codeware_provider_file(p)]
-
-            generic_files = [
-                p for p in code_files
-                if p not in codeware_packages and p not in codeware_providers
-            ]
-
+            all_files = [p for p in stage_root.rglob("*") if p.is_file()]
             runtime_skipped = [
-                p for p in generic_files
+                p
+                for p in all_files
                 if p.suffix.lower() in {".reds", ".tweak", ".yaml"}
-                and not translator.is_lua_localization_file(p)
+                and not translator.is_codeware_package_file(p)
             ]
-
             if runtime_skipped:
                 log_func(
-                    f"Safety mode: skipped {len(runtime_skipped)} unsupported runtime/code file(s) "
-                    "from generic translation."
+                    f"Safety mode: skipped {len(runtime_skipped)} unsupported runtime/code file(s) from generic translation."
                 )
-
             log_func(
-                "Safety mode: generic runtime-source translation is disabled; dedicated localization "
-                "surfaces are handled separately."
+                "Safety mode: generic runtime-source translation is disabled; dedicated localization surfaces are handled separately."
             )
 
             from google import genai
             client = genai.Client(api_key=api_key)
-
-            old_gemini_key = os.environ.get("GEMINI_API_KEY")
-            os.environ["GEMINI_API_KEY"] = api_key
-
+            old_values = (
+                translator.TARGET_LANGUAGE,
+                translator.TARGET_CODE,
+                translator.TERMINOLOGY_FILE,
+                translator.CHECKPOINT_FILE,
+            )
             translator.TARGET_LANGUAGE = target_language
             translator.TARGET_CODE = target_code
             translator.TERMINOLOGY_FILE = str(shared_terms)
-            terminology = translator.load_terminology()
+            translator.CHECKPOINT_FILE = str(work_root / "open_localization_checkpoint.json")
+            try:
+                for package in all_files:
+                    if package.suffix.lower() == ".reds" and translator.is_codeware_package_file(package):
+                        log_func(
+                            "Codeware localization fallback: translating the English package in place."
+                        )
+                        translator.translate_codeware_package(
+                            client,
+                            str(package),
+                            str(package),
+                            translator.load_terminology(),
+                            "English",
+                            log_func,
+                        )
+                for file in all_files:
+                    relative_parts = set(file.relative_to(stage_root).parts)
+                    if "RedscriptConfigFramework" in relative_parts:
+                        try:
+                            if file.suffix.lower() == ".json":
+                                translator.translate_redscript_config_file(
+                                    client,
+                                    str(file),
+                                    translator.load_terminology(),
+                                    log_func,
+                                )
+                            elif file.suffix.lower() == ".txt":
+                                translator.translate_bbcode_txt_file(
+                                    client,
+                                    str(file),
+                                    translator.load_terminology(),
+                                    log_func,
+                                )
+                        except Exception as error:
+                            warning = f"Open-file translation failed for {file.name}: {error}"
+                            translation_warnings.append(warning)
+                            log_func(f"WARNING: {warning}")
+            finally:
+                (
+                    translator.TARGET_LANGUAGE,
+                    translator.TARGET_CODE,
+                    translator.TERMINOLOGY_FILE,
+                    translator.CHECKPOINT_FILE,
+                ) = old_values
 
-            if codeware_packages and target_code != "en-us":
-                target_class = translator.codeware_class_name_for_target(target_language)
-                created_codeware = False
-
-                for package in codeware_packages:
-                    try:
-                        source_class = translator.get_codeware_package_class(package.read_text(encoding="utf-8"))
-                    except Exception:
-                        continue
-
-                    if not source_class or source_class.lower() != "english":
-                        continue
-
-                    target_package = package.parent / f"{target_class}.reds"
-
-                    translator.translate_codeware_package(
-                        client, str(package), str(target_package), terminology, target_class, log_func
-                    )
-                    created_codeware = True
-
-                if created_codeware:
-                    for provider in codeware_providers:
-                        translator.update_codeware_provider(str(provider), target_code, target_class)
-
-            for cf in generic_files:
-                try:
-                    parts = cf.parts
-                    
-                    if "RedscriptConfigFramework" in parts:
-                        if cf.suffix.lower() == ".json":
-                            log_func(f"Translating RedscriptConfig JSON: {cf.name}")
-                            translator.translate_redscript_config_file(client, str(cf), translator.load_terminology(), log_func)
-                        elif cf.suffix.lower() == ".txt":
-                            log_func(f"Translating BBCode TXT: {cf.name}")
-                            translator.translate_bbcode_txt_file(client, str(cf), translator.load_terminology(), log_func)
-                            
-                    elif cf.suffix.lower() == ".json" and path_has_localization_locale(cf, SOURCE_CODE):
-                        with open(cf, "r", encoding="utf-8") as f:
-                            json_data = json.load(f)
-                            
-                        if isinstance(json_data, dict):
-                            translator.INPUT_FILE = str(cf)
-                            translated_dir = work_root / "open_localization"
-                            translated_dir.mkdir(parents=True, exist_ok=True)
-                            
-                            target_name = cf.name.replace(SOURCE_CODE, target_code)
-                            output_json = translated_dir / target_name
-                            
-                            translator.OUTPUT_FILE = str(output_json)
-                            translator.TERMINOLOGY_FILE = str(shared_terms)
-                            translator.CHECKPOINT_FILE = str(work_root / "open_localization_checkpoint.json")
-                            translator.main()
-
-                            target_rel = Path(*[target_code if part.lower() == SOURCE_CODE else part for part in cf.relative_to(stage_root).parts])
-                            target_path = stage_root / target_rel
-                            target_path.parent.mkdir(parents=True, exist_ok=True)
-                            
-                            if output_json.exists():
-                                shutil.copy2(output_json, target_path)
-                            if cf.exists() and cf != target_path:
-                                cf.unlink()
-                                
-                    elif cf.suffix.lower() == ".lua":
-                        # Lua localization is processed by the dedicated selective pass below.
-                        continue
-                    elif cf.suffix.lower() in {".reds", ".tweak", ".yaml"}:
-                        # Runtime/code files are intentionally left unchanged.
-                        continue
-
-                except Exception as e:
-                    warning = f"Open-file translation failed for {cf.name}: {e}"
-                    translation_warnings.append(warning)
-                    log_func(f"WARNING: {warning}")
-
-            if old_gemini_key is None:
+        # Lua localization is a loose-file surface. Keep it outside archive packing.
+        from google import genai
+        client = genai.Client(api_key=api_key)
+        old_values = (
+            translator.TARGET_LANGUAGE,
+            translator.TARGET_CODE,
+            translator.TERMINOLOGY_FILE,
+            translator.CHECKPOINT_FILE,
+        )
+        old_env = os.environ.get("GEMINI_API_KEY")
+        translator.TARGET_LANGUAGE = target_language
+        translator.TARGET_CODE = target_code
+        translator.TERMINOLOGY_FILE = str(shared_terms)
+        translator.CHECKPOINT_FILE = str(work_root / "lua_checkpoint.json")
+        os.environ["GEMINI_API_KEY"] = api_key
+        try:
+            _, lua_failures = process_selective_lua_localization(
+                stage_root, client, shared_terms, log_func
+            )
+            translation_warnings.extend(lua_failures)
+        finally:
+            (
+                translator.TARGET_LANGUAGE,
+                translator.TARGET_CODE,
+                translator.TERMINOLOGY_FILE,
+                translator.CHECKPOINT_FILE,
+            ) = old_values
+            if old_env is None:
                 os.environ.pop("GEMINI_API_KEY", None)
             else:
-                os.environ["GEMINI_API_KEY"] = old_gemini_key
+                os.environ["GEMINI_API_KEY"] = old_env
 
-        # ----------------------------------------------------
-        # SELECTIVE OPEN-FILE LOCALIZATION SURFACES
-        # ----------------------------------------------------
-        # This pass runs for both archive and no-archive source ZIPs.
-        # It only touches Lua files recognized as localization/UI surfaces.
-        if input_path.suffix.lower() == ".zip":
-            from google import genai
-            client = genai.Client(api_key=api_key)
-
-            old_gemini_key = os.environ.get("GEMINI_API_KEY")
-            os.environ["GEMINI_API_KEY"] = api_key
-            old_target_language = translator.TARGET_LANGUAGE
-            old_target_code = translator.TARGET_CODE
-            old_terms = translator.TERMINOLOGY_FILE
-            translator.TARGET_LANGUAGE = target_language
-            translator.TARGET_CODE = target_code
-            translator.TERMINOLOGY_FILE = str(shared_terms)
-            try:
-                _, lua_failures = process_selective_lua_localization(
-                    stage_root=stage_root,
-                    client=client,
-                    terminology_file=shared_terms,
-                    log_func=log_func,
-                )
-                translation_warnings.extend(lua_failures)
-            finally:
-                translator.TARGET_LANGUAGE = old_target_language
-                translator.TARGET_CODE = old_target_code
-                translator.TERMINOLOGY_FILE = old_terms
-                if old_gemini_key is None:
-                    os.environ.pop("GEMINI_API_KEY", None)
-                else:
-                    os.environ["GEMINI_API_KEY"] = old_gemini_key
-
-        # ----------------------------------------------------
-        # FINAL MO2 ZIP (NO STANDALONE ARCHIVE OUTPUT)
-        # ----------------------------------------------------
-        final_zip_base = f"{clean_input_stem}_{target_short}"
+        final_zip_base = f"{clean_stem}_{target_short}"
         final_zip = output_folder / f"{final_zip_base}.zip"
-
         if final_zip.exists():
-            if final_zip.is_file():
-                final_zip.unlink()
-            else:
-                shutil.rmtree(final_zip)
+            final_zip.unlink()
 
         shutil.make_archive(
             str(output_folder / final_zip_base),
             "zip",
             root_dir=stage_root,
         )
-
         if not final_zip.exists():
             raise RuntimeError("MO2 ZIP could not be created.")
 
         log_func("")
         log_func(f"MO2-ready ZIP created: {final_zip}")
-
         return {"zip": final_zip, "warnings": translation_warnings}
 
     finally:
-        if work_root.exists():
-            shutil.rmtree(work_root, ignore_errors=True)
+        # Keep the persistent checkpoint/terminology tree for resume. The temporary
+        # source/stage tree is cleaned after a finished job.
+        for path in (work_root / "source", work_root / "MO2"):
+            if path.exists():
+                shutil.rmtree(path, ignore_errors=True)
 
-# ============================================================
-# GUI
-# ============================================================
 
 class App:
     def __init__(self, root):
@@ -1567,6 +1582,8 @@ class App:
             or "authentication credentials" in lower
         ):
             return UI_TEXT[self.current_ui_language]["invalid_api"]
+        if "503" in lower or "unavailable" in lower:
+            return "Gemini is temporarily unavailable after multiple retry attempts. Please try again later."
 
         return message
 

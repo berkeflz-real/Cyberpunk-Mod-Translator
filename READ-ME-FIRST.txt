@@ -1,36 +1,42 @@
 READ ME FIRST
-Cyberpunk 2077 Mod Translator
 
-ENGLISH
-------------------------------------------------------------
+Cyberpunk 2077 Universal Mod Translator v1.0.3
+
+## ENGLISH
+
 1. Keep all files and folders together.
 2. Do NOT move or rename the "WolvenKit.Console-9.0.1" folder.
 3. Make sure the required .NET runtime is installed before using the translator.
-4. For mod-manager load order, the translated version should load after/below the original mod.
-5. Do not delete the "_internal" folder; it contains files required by the application.
+4. The translated ZIP is a complete replacement package. Install only the translated ZIP in Mod Organizer 2 or manually copy it into the game.
+5. If the original mod is already installed and you do not want to reinstall it, simply install the translated ZIP as a separate mod and let it load after the original.
+6. Do not delete the "_internal" folder; it contains files required by the application.
 
 Important:
-- The bundled WolvenKit Console 9.0.1 is included with this package and must remain next to the application.
-- WolvenKit Console is distributed unmodified under its own GPL-3.0 license. See LICENSE-NOTICE.txt and THIRD-PARTY-NOTICES.txt.
-- The translator requires a valid Gemini API key.
-- Translation quality depends on the source text, Gemini response, and the selected target language.
 
+* The bundled WolvenKit Console 9.0.1 is included with this package and must remain next to the application.
+* WolvenKit Console is distributed unmodified under its own GPL-3.0 license. See LICENSE-NOTICE.txt and THIRD-PARTY-NOTICES.txt.
+* The translator requires a valid Gemini API key.
+* Translation quality depends on the source text, Gemini response, and the selected target language.
+* Supports ArchiveXL OnScreen localization, Codeware localization, Lua localization, and additional localization JSON files used by many Cyberpunk 2077 mods.
 
+---
 
+## TÜRKÇE
 
-TÜRKÇE
-------------------------------------------------------------
 1. Tüm dosya ve klasörleri birlikte tutun.
 2. "WolvenKit.Console-9.0.1" klasörünü taşımayın veya yeniden adlandırmayın.
 3. Çeviriciyi kullanmadan önce gerekli .NET runtime'ın kurulu olduğundan emin olun.
-4. Mod yöneticisi yükleme sıralamasında çevrilmiş sürüm orijinal modun ardından/altında yüklenmelidir.
-5. "_internal" klasörünü silmeyin; uygulamanın çalışması için gerekli dosyaları içerir.
+4. Oluşturulan çeviri ZIP'i tek başına tam kurulum paketidir. Mod Organizer 2'ye yalnızca bunu kurmanız veya oyuna manuel olarak bunu kopyalamanız yeterlidir.
+5. Orijinal mod zaten kuruluysa ve yeniden kurmak istemiyorsanız, çeviri ZIP'ini ayrı bir mod olarak ekleyip yükleme sıralamasında orijinal modun altında çalıştırmanız yeterlidir.
+6. "_internal" klasörünü silmeyin; uygulamanın çalışması için gerekli dosyaları içerir.
 
 Önemli:
-- WolvenKit Console 9.0.1 bu paketle birlikte verilmektedir ve uygulamanın yanında kalmalıdır.
-- WolvenKit Console değiştirilmeden, kendi GPL-3.0 lisansı altında dağıtılmaktadır. Ayrıntılar için LICENSE-NOTICE.txt ve THIRD-PARTY-NOTICES.txt dosyalarına bakın.
-- Çevirici için geçerli bir Gemini API anahtarı gerekir.
-- Çeviri kalitesi kaynak metne, Gemini yanıtına ve seçilen hedef dile bağlıdır.
 
-Cyberpunk 2077 Mod Translator
+* WolvenKit Console 9.0.1 bu paketle birlikte verilmektedir ve uygulamanın yanında kalmalıdır.
+* WolvenKit Console değiştirilmeden, kendi GPL-3.0 lisansı altında dağıtılmaktadır. Ayrıntılar için LICENSE-NOTICE.txt ve THIRD-PARTY-NOTICES.txt dosyalarına bakın.
+* Çevirici için geçerli bir Gemini API anahtarı gerekir.
+* Çeviri kalitesi kaynak metne, Gemini yanıtına ve seçilen hedef dile bağlıdır.
+* ArchiveXL OnScreen, Codeware, Lua ve Cyberpunk 2077 modlarında kullanılan ek localization JSON dosyalarını destekler.
+
+Cyberpunk 2077 Universal Mod Translator
 Author: berkeflz

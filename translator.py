@@ -1,50 +1,39 @@
+import hashlib
 import json
 import os
 import re
 import time
+from pathlib import Path
 
 from google import genai
 from google.genai import types
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
+VERSION = "1.0.3"
 INPUT_FILE = "en-us.json"
 OUTPUT_FILE = "tr-tr.json"
 TERMINOLOGY_FILE = "terminology.json"
 CHECKPOINT_FILE = "checkpoint.json"
-
 MODEL_NAME = "gemini-3.5-flash-lite"
 BATCH_SIZE = 50
 MAX_RETRIES = 5
-
-# Set by app.py before main() is called.
 TARGET_LANGUAGE = "Turkish"
 TARGET_CODE = "tr-tr"
 
-COMMON_UI_WORDS = {
-    "settings", "setting", "enable", "disable", "enabled", "disabled",
-    "save", "cancel", "close", "open", "back", "next", "previous",
-    "continue", "confirm", "apply", "delete", "remove", "yes", "no",
-    "on", "off", "general", "options", "controls", "inventory",
-    "phone", "messages", "message", "new", "loading", "done", "start",
-    "stop", "reset", "default", "description", "speed", "movement",
-}
-
 REDSCRIPT_KEYS = {"category", "name", "desc", "title", "text", "label"}
 
-# ============================================================
-# JSON / FILE HELPERS
-# ============================================================
-
+# ---------------------------------------------------------------------------
+# JSON helpers
+# ---------------------------------------------------------------------------
 def load_json(filename):
     with open(filename, "r", encoding="utf-8") as f:
         return json.load(f)
 
+
 def save_json(filename, data):
+    Path(filename).parent.mkdir(parents=True, exist_ok=True)
     with open(filename, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
 
 def find_input_file():
     for filename in (INPUT_FILE, "en-us.json.json"):
@@ -52,133 +41,295 @@ def find_input_file():
             return filename
     return None
 
+
 def detect_json_format(data):
-    if not isinstance(data, dict):
-        return "unknown"
-    if isinstance(data.get("Data"), dict) and isinstance(data["Data"].get("RootChunk"), dict):
+    if (
+        isinstance(data, dict)
+        and isinstance(data.get("Data"), dict)
+        and isinstance(data["Data"].get("RootChunk"), dict)
+    ):
         return "archive"
-    return "flat"
+    if isinstance(data, dict):
+        return "flat"
+    return "unknown"
 
-# ============================================================
-# ENTRY EXTRACTION
-# ============================================================
-
+# ---------------------------------------------------------------------------
+# Entry extraction / apply
+# ---------------------------------------------------------------------------
 def extract_archive_entries(data):
     try:
         entries = data["Data"]["RootChunk"]["root"]["Data"]["entries"]
     except (KeyError, TypeError):
         return []
-        
+
     result = []
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             continue
-            
         female = entry.get("femaleVariant", "")
         male = entry.get("maleVariant", "")
-        secondary_key = entry.get("secondaryKey", "")
-        
         if not female and not male:
             continue
-            
-        result.append({
-            "index": index, 
-            "secondaryKey": secondary_key, 
-            "female": female, 
-            "male": male
-        })
+        result.append(
+            {
+                "index": index,
+                "secondaryKey": entry.get("secondaryKey", ""),
+                "female": female,
+                "male": male,
+            }
+        )
     return result
+
 
 def extract_flat_entries(data):
     result = []
-    index = 0
     if not isinstance(data, dict):
         return result
-        
-    for key, value in data.items():
+    for index, (key, value) in enumerate(data.items()):
         if isinstance(value, str) and value.strip():
-            result.append({
-                "index": index, 
-                "secondaryKey": key, 
-                "female": value, 
-                "male": ""
-            })
-            index += 1
+            result.append(
+                {
+                    "index": index,
+                    "secondaryKey": str(key),
+                    "female": value,
+                    "male": "",
+                }
+            )
     return result
 
-def create_batches(entries, batch_size):
-    return [entries[i:i + batch_size] for i in range(0, len(entries), batch_size)]
 
-# ============================================================
-# PLACEHOLDERS / TAGS
-# ============================================================
+def create_batches(entries, batch_size=BATCH_SIZE):
+    return [entries[i : i + batch_size] for i in range(0, len(entries), batch_size)]
 
+
+def apply_archive_translations(data, batch, translations):
+    entries = data["Data"]["RootChunk"]["root"]["Data"]["entries"]
+    by_index = {item["index"]: item for item in translations}
+    changed = 0
+    for item in batch:
+        translated = by_index[item["index"]]
+        entry = entries[item["index"]]
+        if entry.get("femaleVariant", ""):
+            entry["femaleVariant"] = translated.get("female", entry.get("femaleVariant", ""))
+        if entry.get("maleVariant", ""):
+            entry["maleVariant"] = translated.get("male", entry.get("maleVariant", ""))
+        changed += 1
+    return changed
+
+
+def apply_flat_translations(data, batch, translations):
+    by_index = {item["index"]: item for item in translations}
+    keys = list(data.keys())
+    changed = 0
+    for item in batch:
+        key = keys[item["index"]]
+        data[key] = by_index[item["index"]].get("female", data[key])
+        changed += 1
+    return changed
+
+# ---------------------------------------------------------------------------
+# Validation / protected tokens
+# ---------------------------------------------------------------------------
 def extract_special_tokens(text):
     if not text:
         return []
-    patterns = [r"<[^>]+>", r"\{[^}]+\}", r"%[^%]+%", r"\\[nrt]"]
+    patterns = [
+        r"<[^>]+>",
+        r"\{[^}]+\}",
+        # Explicit %-delimited placeholders only. Normal percentages like 10%
+        # or 75% are ordinary text and must never be treated as placeholders.
+        r"%(?:[A-Za-z_][A-Za-z0-9_.:-]*|\d+)%",
+        r"\\[nrt]",
+        r"\[(?:/?[A-Za-z*][^\]]*)\]",
+    ]
     tokens = []
     for pattern in patterns:
         tokens.extend(re.findall(pattern, text))
     return tokens
 
+
+def _protect_special_tokens(text):
+    """Replace protected formatting/placeholder tokens with inert sentinels before AI translation.
+
+    This prevents the model from accidentally interpreting RichText/markup such as
+    </>, <Rich ...>, {int_0}, BBCode tags, etc. as natural-language text and
+    duplicating/removing them. The original tokens are restored after the API response.
+    """
+    if not text:
+        return text, []
+
+    tokens = extract_special_tokens(text)
+    if not tokens:
+        return text, []
+
+    protected = text
+    # Replace from left to right, but only the first occurrence of each extracted
+    # token at each step. This preserves duplicate tokens as separate sentinels.
+    for index, token in enumerate(tokens):
+        sentinel = f"__CYTRANS_PROTECTED_{index:03d}__"
+        protected = protected.replace(token, sentinel, 1)
+    return protected, tokens
+
+
+def _restore_special_tokens(text, tokens):
+    """Restore protected tokens exactly once each and discard model-created duplicates.
+
+    Gemini can occasionally repeat a protected sentinel even when the prompt asks it
+    not to. Replacing every occurrence would turn those duplicates back into duplicate
+    RichText/markup tags and make validation fail forever. Keep only the first occurrence
+    of each expected sentinel. Missing sentinels are left for validation/retry because
+    their exact placement cannot be inferred safely here.
+    """
+    if not text or not tokens:
+        return text
+
+    restored = text
+    for index, token in enumerate(tokens):
+        sentinel = f"__CYTRANS_PROTECTED_{index:03d}__"
+        first = restored.find(sentinel)
+        if first < 0:
+            # Do not invent a position for a missing formatting token. The validator
+            # will reject the entry and the selective recovery loop can retry it.
+            continue
+
+        second_start = first + len(sentinel)
+        while True:
+            duplicate = restored.find(sentinel, second_start)
+            if duplicate < 0:
+                break
+            restored = restored[:duplicate] + restored[duplicate + len(sentinel):]
+            second_start = duplicate
+
+        restored = restored.replace(sentinel, token, 1)
+
+    return restored
+
+
+def _protect_batch_payload(batch):
+    payload = []
+    token_maps = {}
+    for item in batch:
+        female, female_tokens = _protect_special_tokens(item.get("female", ""))
+        male, male_tokens = _protect_special_tokens(item.get("male", ""))
+        token_maps[item["index"]] = {"female": female_tokens, "male": male_tokens}
+        payload.append({
+            "index": item["index"],
+            "secondaryKey": item["secondaryKey"],
+            "female": female,
+            "male": male,
+        })
+    return payload, token_maps
+
+
+def _restore_batch_translations(translations, token_maps):
+    if not isinstance(translations, list):
+        return translations
+    for item in translations:
+        if not isinstance(item, dict):
+            continue
+        index = item.get("index")
+        mapping = token_maps.get(index)
+        if not mapping:
+            continue
+        item["female"] = _restore_special_tokens(item.get("female", ""), mapping["female"])
+        item["male"] = _restore_special_tokens(item.get("male", ""), mapping["male"])
+    return translations
+
+
+def _field_diagnostics(source, translated, label):
+    errors = []
+    if source and not translated:
+        errors.append(f"{label} is empty while source is non-empty")
+        return errors
+    source_tokens = sorted(extract_special_tokens(source))
+    target_tokens = sorted(extract_special_tokens(translated))
+    if source_tokens != target_tokens:
+        errors.append(
+            f"{label} special-token mismatch; source={source_tokens!r}, target={target_tokens!r}"
+        )
+    return errors
+
+
 def validate_special_tokens(source, translated):
-    return sorted(extract_special_tokens(source)) == sorted(extract_special_tokens(translated))
+    return not _field_diagnostics(source, translated, "translation")
+
 
 def validate_translation_fields(source, translated):
-    if source and not translated:
-        return False
-    return validate_special_tokens(source, translated)
+    return not _field_diagnostics(source, translated, "translation")
 
-def validate_translations(batch, translations):
-    expected_set = {item["index"] for item in batch}
-    received_set = {item.get("index") for item in translations}
-    
-    errors = []
-    missing = expected_set - received_set
-    extra = received_set - expected_set
-    duplicate = {i for i in set(item.get("index") for item in translations) if [t.get("index") for t in translations].count(i) > 1}
-    
-    if missing:
-        errors.append(f"Missing indices: {sorted(missing)}")
-    if extra:
-        errors.append(f"Unexpected indices: {sorted(extra)}")
-    if duplicate:
-        errors.append(f"Duplicate indices: {sorted(duplicate)}")
 
-    original_by_index = {item["index"]: item for item in batch}
+def diagnose_translation_failures(batch, translations):
+    expected = {item["index"]: item for item in batch}
+    counts = {}
     for item in translations:
-        index = item.get("index")
-        if index not in original_by_index:
+        if isinstance(item, dict):
+            counts[item.get("index")] = counts.get(item.get("index"), 0) + 1
+
+    failures = {}
+    for index in expected:
+        if counts.get(index, 0) == 0:
+            failures[index] = ["Missing translation"]
+        elif counts.get(index, 0) > 1:
+            failures[index] = ["Duplicate translation index"]
+
+    for item in translations:
+        if not isinstance(item, dict):
             continue
-            
-        source = original_by_index[index]
-        if item.get("secondaryKey", "") != source["secondaryKey"]:
-            errors.append(f"secondaryKey mismatch at index {index}")
-            
-        if not validate_translation_fields(source.get("female", ""), item.get("female", "")):
-            errors.append(f"Female translation validation failed at index {index}")
-            
+        index = item.get("index")
+        if index not in expected or counts.get(index, 0) != 1:
+            continue
+
+        source = expected[index]
+        errors = []
+        if item.get("secondaryKey", "") != source.get("secondaryKey", ""):
+            errors.append("secondaryKey mismatch")
+
+        errors.extend(
+            _field_diagnostics(
+                source.get("female", ""),
+                item.get("female", ""),
+                "Female",
+            )
+        )
+
         source_male = source.get("male", "")
         target_male = item.get("male", "")
-        
         if not source_male and target_male:
-            errors.append(f"Male field unexpectedly populated at index {index}")
-        elif source_male and not validate_translation_fields(source_male, target_male):
-            errors.append(f"Male translation validation failed at index {index}")
+            errors.append("Male field unexpectedly populated")
+        elif source_male:
+            errors.extend(_field_diagnostics(source_male, target_male, "Male"))
+
+        if errors:
+            failures[index] = errors
+
+    return failures
+
+
+def validate_translations(batch, translations):
+    failures = diagnose_translation_failures(batch, translations)
+    errors = []
+    for index, reasons in failures.items():
+        for reason in reasons:
+            errors.append(f"index {index}: {reason}")
+
+    expected = {item["index"] for item in batch}
+    received = {
+        item.get("index") for item in translations if isinstance(item, dict)
+    }
+    extra = received - expected
+    if extra:
+        errors.append(f"Unexpected indices: {sorted(extra)}")
 
     return {
-        "has_error": bool(errors), 
-        "errors": errors, 
-        "missing_indices": missing, 
-        "extra_indices": extra, 
-        "duplicate_indices": duplicate
+        "has_error": bool(errors),
+        "errors": errors,
+        "missing_indices": expected - received,
+        "extra_indices": extra,
     }
 
-# ============================================================
-# TERMINOLOGY & CHECKPOINT
-# ============================================================
-
+# ---------------------------------------------------------------------------
+# Terminology / checkpoints
+# ---------------------------------------------------------------------------
 def _load_raw_terminology():
     if not os.path.exists(TERMINOLOGY_FILE):
         return {}
@@ -187,69 +338,83 @@ def _load_raw_terminology():
     except Exception:
         return {}
 
+
 def load_terminology():
     raw = _load_raw_terminology()
     if isinstance(raw, dict) and isinstance(raw.get("languages"), dict):
-        bucket = raw["languages"].get(TARGET_LANGUAGE, {})
-        return dict(bucket) if isinstance(bucket, dict) else {}
-        
-    if TARGET_CODE == "tr-tr" and isinstance(raw, dict) and all(isinstance(v, str) for v in raw.values()):
-        return dict(raw)
-    return {}
+        value = raw["languages"].get(TARGET_LANGUAGE, {})
+        return dict(value) if isinstance(value, dict) else {}
+    return dict(raw) if isinstance(raw, dict) else {}
+
 
 def save_terminology(terminology):
     raw = _load_raw_terminology()
     if not isinstance(raw, dict) or not isinstance(raw.get("languages"), dict):
-        old_flat = raw if isinstance(raw, dict) else {}
         raw = {"languages": {}}
-        if TARGET_CODE == "tr-tr" and old_flat and all(isinstance(v, str) for v in old_flat.values()):
-            raw["languages"]["Turkish"] = old_flat
-            
-    raw["languages"][TARGET_LANGUAGE] = terminology
+    raw["languages"][TARGET_LANGUAGE] = dict(terminology)
     save_json(TERMINOLOGY_FILE, raw)
 
+
 def merge_terminology(terminology, new_terms):
-    if not isinstance(new_terms, list):
-        return terminology
-        
-    for item in new_terms:
+    for item in new_terms or []:
         if not isinstance(item, dict):
             continue
         english = str(item.get("english", "")).strip()
-        translation = str(item.get("translation", item.get("target", item.get("turkish", "")))).strip()
-        
+        translation = str(
+            item.get("translation", item.get("target", item.get("turkish", "")))
+        ).strip()
         if english and translation and english not in terminology:
             terminology[english] = translation
     return terminology
+
+
+def _fingerprint(path):
+    hasher = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            hasher.update(chunk)
+    return {
+        "input": os.path.abspath(path),
+        "sha256": hasher.hexdigest(),
+        "target_code": TARGET_CODE,
+    }
+
 
 def load_checkpoint():
     if not os.path.exists(CHECKPOINT_FILE):
         return {"completed_batches": []}
     try:
         value = load_json(CHECKPOINT_FILE)
-        if isinstance(value, dict):
-            value.setdefault("completed_batches", [])
-            return value
+        return value if isinstance(value, dict) else {"completed_batches": []}
     except Exception:
-        pass
-    return {"completed_batches": []}
+        return {"completed_batches": []}
 
-def save_checkpoint(completed_batches):
-    save_json(CHECKPOINT_FILE, {"completed_batches": sorted(completed_batches)})
 
-# ============================================================
-# GEMINI
-# ============================================================
+def save_checkpoint(completed_batches, metadata=None):
+    payload = {"completed_batches": sorted(set(completed_batches))}
+    if metadata is not None:
+        payload["metadata"] = metadata
+    save_json(CHECKPOINT_FILE, payload)
 
-def translate_batch(client, batch, terminology):
-    payload = [
-        {
-            "index": item["index"],
-            "female": item["female"],
-            "male": item["male"]
-        } for item in batch
-    ]
-    
+# ---------------------------------------------------------------------------
+# Gemini / retries
+# ---------------------------------------------------------------------------
+def _transient_api_error(error):
+    text = str(error).upper()
+    return any(
+        marker in text
+        for marker in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")
+    )
+
+
+def _backoff_seconds(attempt):
+    return min(30, 2 ** max(0, attempt - 1))
+
+
+def translate_batch(client, batch, terminology, validation_feedback=None):
+    payload, token_maps = _protect_batch_payload(batch)
+
+    feedback = validation_feedback or "None"
     prompt = f"""
 You are a professional Cyberpunk 2077 mod localization translator.
 Translate English user-visible text into {TARGET_LANGUAGE}.
@@ -257,27 +422,36 @@ Translate English user-visible text into {TARGET_LANGUAGE}.
 STRICT RULES:
 1. Return every supplied index exactly once.
 2. Never change index.
-3. Return only translation fields; do not invent or modify internal metadata.
+3. Never change secondaryKey.
 4. Translate only female and male.
 5. If source male is empty, target male must stay empty.
-6. Ordinary UI labels must not remain in English. Examples: Settings, Enable, Disable, Save, Cancel, Continue, Close, General, Speed.
+6. Translate ordinary UI labels naturally.
 7. Preserve proper nouns and established Cyberpunk terminology where natural.
-8. Preserve ALL placeholders, tags, variables, escape sequences, and BBCode (like [b], [color=...], [list], [*], [i]).
-9. DO NOT translate any code or technical text inside [code]...[/code] blocks.
-10. Use natural, idiomatic {TARGET_LANGUAGE}, not literal English word order.
-11. If a source sentence is ordinary user-visible text, do not simply repeat the English source unchanged.
+8. Preserve ALL placeholders, tags, variables, escape sequences, and BBCode. Protected tokens
+   are represented as __CYTRANS_PROTECTED_NNN__ sentinels; copy each sentinel exactly once and
+   never translate, duplicate, delete, reorder, or otherwise modify a sentinel.
+9. Do not translate code/technical identifiers inside protected syntax.
+10. Never change internal identifiers.
+11. Use natural, idiomatic {TARGET_LANGUAGE}.
+12. Use native Unicode for the target language; never transliterate into ASCII.
+13. For Turkish, preserve ğ Ğ ı İ ö Ö ş Ş ü Ü when applicable.
+14. Normal percentages such as 10% and 75% are ordinary text, not placeholders.
 
-TERMINOLOGY FOR {TARGET_LANGUAGE}:
+VALIDATION RECOVERY FEEDBACK:
+{feedback}
+
+TERMINOLOGY:
 {json.dumps(terminology, ensure_ascii=False, indent=2)}
 
 ENTRIES:
 {json.dumps(payload, ensure_ascii=False, indent=2)}
 
-Return ONLY JSON in this schema:
+Return ONLY JSON in this schema. If no new terminology is needed, return an empty newTerminology array:
 {{
   "translations": [
     {{
       "index": 0,
+      "secondaryKey": "...",
       "female": "...",
       "male": "..."
     }}
@@ -290,6 +464,7 @@ Return ONLY JSON in this schema:
   ]
 }}
 """
+
     response = client.models.generate_content(
         model=MODEL_NAME,
         contents=prompt,
@@ -305,10 +480,16 @@ Return ONLY JSON in this schema:
                             "type": "object",
                             "properties": {
                                 "index": {"type": "integer"},
+                                "secondaryKey": {"type": "string"},
                                 "female": {"type": "string"},
                                 "male": {"type": "string"},
                             },
-                            "required": ["index", "female", "male"],
+                            "required": [
+                                "index",
+                                "secondaryKey",
+                                "female",
+                                "male",
+                            ],
                         },
                     },
                     "newTerminology": {
@@ -327,506 +508,468 @@ Return ONLY JSON in this schema:
             },
         ),
     )
-
-    if not response.text:
-        raise RuntimeError("Gemini returned an empty response.")
-
     result = json.loads(response.text)
-
-    # secondaryKey is immutable source metadata. It is keyed by index and
-    # must never depend on model output. Reattach it from the original batch
-    # before validation/application so a model typo cannot invalidate an
-    # otherwise correct translation batch.
-    original_by_index = {item["index"]: item for item in batch}
-    for item in result.get("translations", []):
-        if not isinstance(item, dict):
-            continue
-        index = item.get("index")
-        source = original_by_index.get(index)
-        if source is not None:
-            item["secondaryKey"] = source["secondaryKey"]
-
+    result["translations"] = _restore_batch_translations(
+        result.get("translations", []),
+        token_maps,
+    )
     return result
 
-# ============================================================
-# APPLY TRANSLATIONS
-# ============================================================
 
-def apply_archive_translations(data, batch, translations):
-    entries = data.get("Data", {}).get("RootChunk", {}).get("root", {}).get("Data", {}).get("entries", [])
-    by_index = {item["index"]: item for item in translations}
-    changed = 0
-    
-    for original in batch:
-        index = original["index"]
-        translation = by_index.get(index)
-        
-        if translation is None:
-            raise RuntimeError(f"Missing translation for index {index}.")
-        if index >= len(entries):
-            raise RuntimeError(f"Invalid entry index {index}.")
-            
-        entry = entries[index]
-        if entry.get("secondaryKey", "") != translation.get("secondaryKey", ""):
-            raise RuntimeError(f"secondaryKey mismatch at index {index}.")
-        
-        if "femaleVariant" in entry:
-            source = entry.get("femaleVariant", "")
-            target = translation.get("female", "")
-            if not validate_translation_fields(source, target):
-                raise RuntimeError(f"Female translation validation failed at index {index}.")
-            entry["femaleVariant"] = target
-            
-        if "maleVariant" in entry:
-            source = entry.get("maleVariant", "")
-            target = translation.get("male", "")
-            if source:
-                if not validate_translation_fields(source, target):
-                    raise RuntimeError(f"Male translation validation failed at index {index}.")
-                entry["maleVariant"] = target
-            elif target:
-                raise RuntimeError(f"Male unexpectedly populated at index {index}.")
-        changed += 1
-        
-    return changed
-
-def apply_flat_translations(data, batch, translations):
-    by_index = {item["index"]: item for item in translations}
-    changed = 0
-    
-    for original in batch:
-        translation = by_index[original["index"]]
-        key = original["secondaryKey"]
-        source = data[key]
-        target = translation.get("female", "")
-        
-        if not validate_translation_fields(source, target):
-            raise RuntimeError(f"Flat JSON translation validation failed for key {key}.")
-        data[key] = target
-        changed += 1
-        
-    return changed
-
-# ============================================================
-# GENERIC OPEN-FILE TRANSLATION
-# ============================================================
-
-def extract_safe_code_strings(content):
-    pattern = r'"([^"\\]*(?:\\.[^"\\]*)*)"'
-    values = []
-    
-    for value in re.findall(pattern, content):
-        stripped = value.strip()
-        if len(stripped) <= 2:
-            continue
-        if re.search(r"https?://", stripped):
-            continue
-        if re.search(r"[/\\]", stripped):
-            continue
-        if re.fullmatch(r"[A-Za-z0-9_.:-]+", stripped):
-            if stripped.lower() not in COMMON_UI_WORDS:
-                continue
-        values.append(value)
-        
-    return list(dict.fromkeys(values))
-
-def translate_code_file(client, filepath, terminology, log_func=None):
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            content = f.read()
-    except Exception:
-        return False
-
-    strings = extract_safe_code_strings(content)
-    if not strings:
-        return False
-
-    batch = [
-        {
-            "index": i, 
-            "secondaryKey": value, 
-            "female": value, 
-            "male": ""
-        } for i, value in enumerate(strings)
+def _build_recovery_feedback(failures, batch, translations):
+    source_by_index = {item["index"]: item for item in batch}
+    previous_by_index = {
+        item.get("index"): item
+        for item in translations
+        if isinstance(item, dict)
+    }
+    lines = [
+        "Validation failed for these specific entries. Correct ONLY those entries.",
+        "Preserve every placeholder, tag, escape sequence, percentage, and secondaryKey exactly.",
     ]
+    for index in sorted(failures):
+        source = source_by_index[index]
+        lines.append(f"INDEX {index}: {'; '.join(failures[index])}")
+        lines.append(f"SOURCE FEMALE: {source.get('female', '')[:1000]}")
+        previous = previous_by_index.get(index)
+        if previous and previous.get("female"):
+            lines.append(f"PREVIOUS FEMALE: {previous.get('female', '')[:1000]}")
+        if source.get("male"):
+            lines.append(f"SOURCE MALE: {source.get('male', '')[:1000]}")
+    return "\n".join(lines)
+
+
+def translate_batch_with_recovery(
+    client,
+    batch,
+    terminology,
+    log_func=None,
+    label="batch",
+):
+    remaining = list(batch)
+    current_terms = dict(terminology or {})
+    collected = {}
+    feedback = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            result = translate_batch(client, batch, terminology)
-            translations = result.get("translations", [])
-            validation = validate_translations(batch, translations)
-            
-            if validation["has_error"]:
-                raise RuntimeError("Validation failed: " + " | ".join(validation["errors"]))
+            if log_func:
+                if feedback:
+                    log_func(
+                        f"-> Validation recovery round {attempt}/{MAX_RETRIES}: "
+                        f"retrying {len(remaining)} failed entrie(s) for {label}."
+                    )
+                else:
+                    log_func(
+                        f"-> Translation request round {attempt}/{MAX_RETRIES} for {label}..."
+                    )
 
-            by_index = {item["index"]: item for item in translations}
-            replacements = []
-            
-            for match in re.finditer(r'"([^"\\]*(?:\\.[^"\\]*)*)"', content):
-                original = match.group(1)
-                if original not in strings:
+            result = translate_batch(
+                client,
+                remaining,
+                current_terms,
+                validation_feedback=feedback,
+            )
+            translations = result.get("translations", [])
+            if log_func:
+                log_func(
+                    f"-> Translations received: {len(translations)} for {label}."
+                )
+
+            current_terms = merge_terminology(
+                current_terms,
+                result.get("newTerminology", []),
+            )
+            failures = diagnose_translation_failures(remaining, translations)
+            remaining_indexes = {item["index"] for item in remaining}
+            counts = {}
+            for item in translations:
+                if isinstance(item, dict):
+                    counts[item.get("index")] = counts.get(item.get("index"), 0) + 1
+
+            for item in translations:
+                if not isinstance(item, dict):
                     continue
-                    
-                index = strings.index(original)
-                translated = by_index[index].get("female", original)
-                
-                if not validate_translation_fields(original, translated):
-                    raise RuntimeError(f"Invalid code string translation: {original}")
-                    
-                replacements.append((match.start(1), match.end(1), translated))
+                index = item.get("index")
+                if (
+                    index in remaining_indexes
+                    and counts.get(index) == 1
+                    and index not in failures
+                ):
+                    collected[index] = item
 
-            for start, end, replacement in reversed(replacements):
-                content = content[:start] + replacement + content[end:]
-                
-            if replacements:
-                with open(filepath, "w", encoding="utf-8") as f:
-                    f.write(content)
-                return True
-            return False
-            
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+            if not failures:
+                ordered = [collected[item["index"]] for item in batch]
+                return {"translations": ordered, "terminology": current_terms}
+
+            if log_func:
+                for index in sorted(failures):
+                    log_func(
+                        f"-> Validation detail at index {index}: "
+                        + " | ".join(failures[index])
+                    )
+                good = len(remaining) - len(failures)
+                if good:
+                    log_func(
+                        f"-> Keeping {good} valid result(s); only "
+                        f"{len(failures)} failed entrie(s) will be retried."
+                    )
+
+            remaining = [
+                item for item in remaining if item["index"] in failures
+            ]
+            feedback = _build_recovery_feedback(failures, remaining, translations)
+
+            if attempt < MAX_RETRIES:
+                delay = _backoff_seconds(attempt)
                 if log_func:
-                    log_func("API kotası doldu (15 istek/dakika). Modül 60 saniye beklemeye alındı...")
-                time.sleep(60)
+                    log_func(
+                        f"-> Validation retry backoff: {delay}s before retry {attempt + 1}/{MAX_RETRIES}."
+                    )
+                time.sleep(delay)
+
+        except Exception as error:
+            if _transient_api_error(error) and attempt < MAX_RETRIES:
+                delay = _backoff_seconds(attempt)
+                if log_func:
+                    log_func(
+                        f"-> Gemini temporarily unavailable; retrying in {delay}s "
+                        f"({attempt + 1}/{MAX_RETRIES})..."
+                    )
+                time.sleep(delay)
                 continue
-            if attempt >= MAX_RETRIES:
-                if log_func:
-                    log_func(f"Generic code translation failed: {e}")
-                raise
-            time.sleep(attempt * 2)
-            
-    return False
 
-# ============================================================
-# REDSCRIPT CONFIG FRAMEWORK (JSON & TXT)
-# ============================================================
-
-def extract_redscript_config_values(data, strings_set):
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if k in REDSCRIPT_KEYS and isinstance(v, str) and len(v.strip()) > 1:
-                strings_set.add(v)
-            else:
-                extract_redscript_config_values(v, strings_set)
-    elif isinstance(data, list):
-        for item in data:
-            extract_redscript_config_values(item, strings_set)
-
-def translate_redscript_config_file(client, filepath, terminology, log_func=None):
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except:
-        return False
-
-    strings_set = set()
-    extract_redscript_config_values(data, strings_set)
-    strings = list(strings_set)
-    
-    if not strings:
-        return False
-
-    if log_func:
-        log_func(f"  -> Bulunan metin sayısı: {len(strings)}")
-
-    batch = [
-        {
-            "index": i, 
-            "secondaryKey": val, 
-            "female": val, 
-            "male": ""
-        } for i, val in enumerate(strings)
-    ]
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            if log_func:
-                log_func(f"  -> Gemini API'den yanıt bekleniyor (Deneme {attempt})...")
-
-            result = translate_batch(client, batch, terminology)
-            translations = result.get("translations", [])
-            validation = validate_translations(batch, translations)
-            
-            if validation["has_error"]:
-                raise RuntimeError("Config JSON Validation failed.")
-
-            if log_func:
-                log_func("  -> Çeviri başarılı, dosyaya yazılıyor...")
-
-            by_index = {item["index"]: item for item in translations}
-            
-            def replace_values(d):
-                if isinstance(d, dict):
-                    for k, v in d.items():
-                        if k in REDSCRIPT_KEYS and isinstance(v, str) and v in strings:
-                            d[k] = by_index[strings.index(v)].get("female", v)
-                        else:
-                            replace_values(v)
-                elif isinstance(d, list):
-                    for item in d:
-                        replace_values(item)
-                    
-            replace_values(data)
-            
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            
-            if log_func:
-                log_func("  -> İşlem tamamlandı.")
-            return True
-            
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                if log_func:
-                    log_func("API kotası doldu (15 istek/dakika). Modül 60 saniye beklemeye alındı...")
-                time.sleep(60)
-                continue
             if attempt >= MAX_RETRIES:
                 raise
-            time.sleep(attempt * 2)
-            
-    return False
 
-def translate_bbcode_txt_file(client, filepath, terminology, log_func=None):
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            content = f.read()
-    except:
-        return False
-
-    paragraphs = [p.strip() for p in content.split('\n\n') if p.strip() and re.search(r'[a-zA-Z]', p)]
-    paragraphs = list(dict.fromkeys(paragraphs))
-    
-    if not paragraphs:
-        return False
-
-    if log_func:
-        log_func(f"  -> Bulunan paragraf sayısı: {len(paragraphs)}")
-
-    batch = [
-        {
-            "index": i, 
-            "secondaryKey": p, 
-            "female": p, 
-            "male": ""
-        } for i, p in enumerate(paragraphs)
-    ]
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
+            delay = _backoff_seconds(attempt)
             if log_func:
-                log_func(f"  -> Gemini API'den yanıt bekleniyor (Deneme {attempt}). Bu uzun sürebilir...")
+                log_func(f"-> Translation round retry in {delay}s: {error}")
+            time.sleep(delay)
 
-            result = translate_batch(client, batch, terminology)
-            translations = result.get("translations", [])
-            validation = validate_translations(batch, translations)
-            
-            if validation["has_error"]:
-                raise RuntimeError("BBCode TXT Validation failed.")
+    raise RuntimeError(f"{label} failed after {MAX_RETRIES} recovery rounds.")
 
-            if log_func:
-                log_func("  -> Çeviri başarılı, dosyaya yazılıyor...")
-
-            by_index = {item["index"]: item for item in translations}
-            
-            for i, p in enumerate(paragraphs):
-                translated_p = by_index[i].get("female", p)
-                content = content.replace(p, translated_p)
-                
-            with open(filepath, "w", encoding="utf-8") as f:
-                f.write(content)
-            
-            if log_func:
-                log_func("  -> İşlem tamamlandı.")
-            return True
-            
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                if log_func:
-                    log_func("API kotası doldu (15 istek/dakika). Modül 60 saniye beklemeye alındı...")
-                time.sleep(60)
-                continue
-            if attempt >= MAX_RETRIES:
-                raise
-            time.sleep(attempt * 2)
-            
-    return False
-
-# ============================================================
-# CODEWARE LOCALIZATION
-# ============================================================
-
+# ---------------------------------------------------------------------------
+# Codeware localization
+# ---------------------------------------------------------------------------
 CODEWARE_PACKAGE_RE = re.compile(
-    r"(public\s+class\s+)([A-Za-z_][A-Za-z0-9_]*)(\s+extends\s+ModLocalizationPackage\b)", 
-    re.MULTILINE
+    r"(public\s+class\s+)([A-Za-z_][A-Za-z0-9_]*)(\s+extends\s+ModLocalizationPackage\b)",
+    re.MULTILINE,
 )
 CODEWARE_TEXT_RE = re.compile(
-    r'(this\.Text\(\s*")((?:[^"\\]|\\.)*)("\s*,\s*")((?:[^"\\]|\\.)*)(")', 
-    re.MULTILINE
+    r'(this\.Text\(\s*")((?:[^"\\]|\\.)*)("\s*,\s*")((?:[^"\\]|\\.)*)(")',
+    re.MULTILINE,
 )
-CODEWARE_PROVIDER_RE = re.compile(
-    r"extends\s+ModLocalizationProvider\b", 
-    re.MULTILINE
-)
+CODEWARE_PROVIDER_RE = re.compile(r"extends\s+ModLocalizationProvider\b", re.MULTILINE)
+
 
 def is_codeware_package_file(filepath):
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            content = f.read()
+        content = Path(filepath).read_text(encoding="utf-8")
     except Exception:
         return False
     return CODEWARE_PACKAGE_RE.search(content) is not None and "this.Text(" in content
 
+
 def is_codeware_provider_file(filepath):
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            content = f.read()
+        content = Path(filepath).read_text(encoding="utf-8")
     except Exception:
         return False
     return CODEWARE_PROVIDER_RE.search(content) is not None and "GetPackage" in content
+
 
 def get_codeware_package_class(content):
     match = CODEWARE_PACKAGE_RE.search(content)
     return match.group(2) if match else None
 
+
 def codeware_class_name_for_target(target_language):
     words = re.findall(r"[A-Za-z0-9]+", target_language)
-    return "".join(word[:1].upper() + word[1:] for word in words) if words else "Translated"
+    return "".join(word[:1].upper() + word[1:] for word in words) or "Translated"
+
 
 def extract_codeware_entries(content):
     return [
         {
-            "index": index, 
-            "secondaryKey": match.group(2), 
-            "female": match.group(4), 
-            "male": "", 
-            "value_start": match.start(4), 
-            "value_end": match.end(4)
-        } for index, match in enumerate(CODEWARE_TEXT_RE.finditer(content))
+            "index": index,
+            "secondaryKey": match.group(2),
+            "female": match.group(4),
+            "male": "",
+            "value_start": match.start(4),
+            "value_end": match.end(4),
+        }
+        for index, match in enumerate(CODEWARE_TEXT_RE.finditer(content))
     ]
 
-def translate_codeware_package(client, filepath, output_filepath, terminology, target_class_name, log_func=None):
-    with open(filepath, "r", encoding="utf-8") as f:
-        source_content = f.read()
-        
+
+def translate_codeware_package(
+    client,
+    filepath,
+    output_filepath,
+    terminology,
+    target_class_name="English",
+    log_func=None,
+):
+    source_content = Path(filepath).read_text(encoding="utf-8")
     entries = extract_codeware_entries(source_content)
     if not entries:
+        if log_func:
+            log_func("Codeware package detected but contains no translatable entries.")
         return False
 
     translations_by_index = {}
-    batches = create_batches(entries, BATCH_SIZE)
-    
-    for batch_number, batch in enumerate(batches, start=1):
-        if log_func:
-            log_func(f"Codeware localization batch {batch_number}/{len(batches)}")
-            
-        success = False
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                result = translate_batch(client, batch, terminology)
-                translations = result.get("translations", [])
-                validation = validate_translations(batch, translations)
-                
-                if validation["has_error"]:
-                    raise RuntimeError("Codeware validation failed: " + " | ".join(validation["errors"]))
-
-                terminology = merge_terminology(terminology, result.get("newTerminology", []))
-                save_terminology(terminology)
-                
-                for item in translations:
-                    translations_by_index[item["index"]] = item
-                success = True
-                break
-                
-            except Exception as e:
-                err_str = str(e)
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    if log_func:
-                        log_func("API kotası doldu (15 istek/dakika). Modül 60 saniye beklemeye alındı...")
-                    time.sleep(60)
-                    continue
-                if attempt >= MAX_RETRIES:
-                    raise
-                time.sleep(attempt * 2)
-                
-        if not success:
-            raise RuntimeError(f"Codeware batch {batch_number} failed.")
+    current_terms = dict(terminology or {})
+    batches = create_batches(entries)
+    for batch_number, batch in enumerate(batches, 1):
+        recovery = translate_batch_with_recovery(
+            client,
+            batch,
+            current_terms,
+            log_func=log_func,
+            label=f"Codeware localization batch {batch_number}/{len(batches)}",
+        )
+        current_terms = recovery["terminology"]
+        for item in recovery["translations"]:
+            translations_by_index[item["index"]] = item
+        save_terminology(current_terms)
 
     translated_content = source_content
-    replacements = []
-    
-    for entry in entries:
+    for entry in reversed(entries):
         translation = translations_by_index.get(entry["index"])
         if translation is None:
-            raise RuntimeError(f"Missing Codeware translation for {entry['secondaryKey']}")
-            
+            raise RuntimeError(
+                f"Missing Codeware translation for {entry['secondaryKey']}"
+            )
         source = entry["female"]
-        target = translation.get("female", "")
-        
+        target = translation.get("female", source)
         if not validate_translation_fields(source, target):
-            raise RuntimeError(f"Invalid Codeware translation for {entry['secondaryKey']}")
-            
-        replacements.append((entry["value_start"], entry["value_end"], target))
+            raise RuntimeError(
+                f"Invalid Codeware translation for {entry['secondaryKey']}"
+            )
+        translated_content = (
+            translated_content[: entry["value_start"]]
+            + target
+            + translated_content[entry["value_end"] :]
+        )
 
-    for start, end, replacement in reversed(replacements):
-        translated_content = translated_content[:start] + replacement + translated_content[end:]
-        
-    translated_content = CODEWARE_PACKAGE_RE.sub(
-        lambda match: f"{match.group(1)}{target_class_name}{match.group(3)}", 
-        translated_content, 
-        count=1
-    )
-    
+    # Keep the class named English. The provider's existing en-us fallback can
+    # therefore serve the translated text without modifying provider code.
     Path(output_filepath).parent.mkdir(parents=True, exist_ok=True)
-    with open(output_filepath, "w", encoding="utf-8") as f:
-        f.write(translated_content)
-        
+    Path(output_filepath).write_text(translated_content, encoding="utf-8")
     return True
+
 
 def update_codeware_provider(provider_filepath, target_code, target_class_name):
-    with open(provider_filepath, "r", encoding="utf-8") as f:
-        content = f.read()
-        
-    case_re = re.compile(
-        rf'case\s+n"{re.escape(target_code)}"\s*:\s*\n?\s*return\s+new\s+([A-Za-z_][A-Za-z0-9_]*)\(\);', 
-        re.MULTILINE
+    # Retained for compatibility with earlier releases. v1.0.3 intentionally
+    # does not patch providers for the fallback-compatible in-place strategy.
+    return False
+
+# ---------------------------------------------------------------------------
+# Redscript Config / BBCode TXT
+# ---------------------------------------------------------------------------
+def extract_redscript_config_values(data, output):
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key in REDSCRIPT_KEYS and isinstance(value, str) and len(value.strip()) > 1:
+                output.add(value)
+            else:
+                extract_redscript_config_values(value, output)
+    elif isinstance(data, list):
+        for value in data:
+            extract_redscript_config_values(value, output)
+
+
+def translate_redscript_config_file(client, filepath, terminology, log_func=None):
+    try:
+        data = load_json(filepath)
+    except Exception:
+        return False
+    values = set()
+    extract_redscript_config_values(data, values)
+    strings = list(values)
+    if not strings:
+        return False
+
+    batch = [
+        {"index": i, "secondaryKey": text, "female": text, "male": ""}
+        for i, text in enumerate(strings)
+    ]
+    recovery = translate_batch_with_recovery(
+        client,
+        batch,
+        terminology,
+        log_func=log_func,
+        label=f"RedscriptConfig {Path(filepath).name}",
     )
-    replacement = f'case n"{target_code}":\n        return new {target_class_name}();'
+    by_index = {item["index"]: item for item in recovery["translations"]}
 
-    if case_re.search(content):
-        content = case_re.sub(replacement, content, count=1)
-    else:
-        marker = re.search(r"(switch\s+language\s*\{\n)", content)
-        if not marker:
-            raise RuntimeError(f"Codeware GetPackage switch not found: {provider_filepath}")
-        content = content[:marker.end()] + "      " + replacement + "\n" + content[marker.end():]
+    def replace_values(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in REDSCRIPT_KEYS and isinstance(child, str) and child in strings:
+                    value[key] = by_index[strings.index(child)].get("female", child)
+                else:
+                    replace_values(child)
+        elif isinstance(value, list):
+            for child in value:
+                replace_values(child)
 
-    with open(provider_filepath, "w", encoding="utf-8") as f:
-        f.write(content)
-        
+    replace_values(data)
+    save_json(filepath, data)
     return True
 
-# ============================================================
-# MAIN
-# ============================================================
 
+def translate_bbcode_txt_file(client, filepath, terminology, log_func=None):
+    content = Path(filepath).read_text(encoding="utf-8")
+    paragraphs = list(
+        dict.fromkeys(
+            [
+                paragraph.strip()
+                for paragraph in content.split("\n\n")
+                if paragraph.strip() and re.search(r"[A-Za-z]", paragraph)
+            ]
+        )
+    )
+    if not paragraphs:
+        return False
+
+    batch = [
+        {"index": i, "secondaryKey": p, "female": p, "male": ""}
+        for i, p in enumerate(paragraphs)
+    ]
+    recovery = translate_batch_with_recovery(
+        client,
+        batch,
+        terminology,
+        log_func=log_func,
+        label=f"BBCode TXT {Path(filepath).name}",
+    )
+    by_index = {item["index"]: item for item in recovery["translations"]}
+    for i, paragraph in enumerate(paragraphs):
+        content = content.replace(paragraph, by_index[i].get("female", paragraph))
+    Path(filepath).write_text(content, encoding="utf-8")
+    return True
+
+# ---------------------------------------------------------------------------
+# Selective Lua localization
+# ---------------------------------------------------------------------------
+LUA_KEY_RE = re.compile(
+    r'(?P<prefix>\b(?:title|description|label|tooltip|displayName|settingName|categoryName|text|header|help|message)\s*=\s*")'
+    r'(?P<value>(?:[^"\\]|\\.)*)(?P<suffix>")',
+    re.IGNORECASE,
+)
+LUA_CALL_RE = re.compile(
+    r'(?P<prefix>\b(?:localize|getText|gettext|tr|translateText)\s*\(\s*")'
+    r'(?P<value>(?:[^"\\]|\\.)*)(?P<suffix>")',
+    re.IGNORECASE,
+)
+
+
+def _lua_candidates(content):
+    matches = []
+    for regex in (LUA_KEY_RE, LUA_CALL_RE):
+        matches.extend(regex.finditer(content))
+    matches.sort(key=lambda match: match.start())
+    unique = []
+    seen = set()
+    for match in matches:
+        if match.start() not in seen:
+            unique.append(match)
+            seen.add(match.start())
+    return unique
+
+
+def is_lua_localization_file(filepath):
+    try:
+        content = Path(filepath).read_text(encoding="utf-8")
+    except Exception:
+        return False
+    lower = content.lower()
+    name = Path(filepath).name.lower()
+    candidates = _lua_candidates(content)
+    if not candidates:
+        return False
+    if any(
+        marker in name
+        for marker in ("settings", "localization", "locale", "loc", "ui", "menu", "config")
+    ):
+        return True
+    return any(
+        marker in lower
+        for marker in (
+            "nativesettings",
+            "modsettings",
+            "registersetting",
+            "registerinput",
+            "settings",
+            "localize(",
+            "gettext(",
+            "tooltip",
+            "displayname",
+        )
+    )
+
+
+def translate_lua_localization_file(client, filepath, terminology, log_func=None):
+    path = Path(filepath)
+    content = path.read_text(encoding="utf-8")
+    matches = _lua_candidates(content)
+    entries = []
+    for match_index, match in enumerate(matches):
+        value = match.group("value")
+        if len(value.strip()) < 2 or not re.search(r"[A-Za-z]", value):
+            continue
+        entries.append(
+            {
+                "index": match_index,
+                "secondaryKey": value,
+                "female": value,
+                "male": "",
+                "start": match.start("value"),
+                "end": match.end("value"),
+            }
+        )
+    if not entries:
+        return False
+
+    recovery = translate_batch_with_recovery(
+        client,
+        entries,
+        terminology,
+        log_func=log_func,
+        label=f"Lua {path.name}",
+    )
+    by_index = {item["index"]: item for item in recovery["translations"]}
+    replacements = []
+    for entry in entries:
+        target = by_index[entry["index"]].get("female", entry["female"])
+        if not validate_translation_fields(entry["female"], target):
+            raise RuntimeError(f"Invalid Lua translation at index {entry['index']}")
+        escaped = json.dumps(target, ensure_ascii=False)[1:-1]
+        replacements.append((entry["start"], entry["end"], escaped))
+
+    for start, end, replacement in reversed(replacements):
+        content = content[:start] + replacement + content[end:]
+    path.write_text(content, encoding="utf-8")
+    return True
+
+# ---------------------------------------------------------------------------
+# Main translator entry point
+# ---------------------------------------------------------------------------
 def main():
     actual_input = find_input_file()
     if not actual_input:
         raise FileNotFoundError("Source JSON file not found.")
-        
+
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise ValueError("GEMINI_API_KEY is not set.")
-    
-    client = genai.Client(api_key=api_key)
-    data = load_json(OUTPUT_FILE) if os.path.exists(OUTPUT_FILE) else load_json(actual_input)
-    mode = detect_json_format(data)
 
+    client = genai.Client(api_key=api_key)
+    output_exists = os.path.exists(OUTPUT_FILE)
+    data = load_json(OUTPUT_FILE) if output_exists else load_json(actual_input)
+    mode = detect_json_format(data)
     if mode == "archive":
         entries = extract_archive_entries(data)
     elif mode == "flat":
@@ -842,69 +985,70 @@ def main():
     print("============================================================")
     print("CYBERPUNK 2077 AI TRANSLATOR")
     print("============================================================")
-    print(f"Target language: {TARGET_LANGUAGE}\nEntries: {len(entries)}\nBatch size: {BATCH_SIZE}")
+    print(f"Target language: {TARGET_LANGUAGE}")
+    print(f"Entries: {len(entries)}")
+    print(f"Batch size: {BATCH_SIZE}")
 
-    batches = create_batches(entries, BATCH_SIZE)
-    terminology = load_terminology()
+    batches = create_batches(entries)
+    metadata = _fingerprint(actual_input)
     checkpoint = load_checkpoint()
-    completed = set(checkpoint.get("completed_batches", []))
+    checkpoint_valid = (
+        output_exists and checkpoint.get("metadata") == metadata
+    )
+    completed = (
+        set(checkpoint.get("completed_batches", [])) if checkpoint_valid else set()
+    )
     print(f"Completed batches: {len(completed)}/{len(batches)}")
 
+    if completed and len(completed) < len(batches):
+        first_incomplete = next(
+            index for index in range(len(batches)) if index not in completed
+        )
+        print(
+            f"Resuming from batch {first_incomplete + 1}/{len(batches)}"
+        )
+
+    terminology = load_terminology()
     for batch_index, batch in enumerate(batches):
         if batch_index in completed:
-            print(f"BATCH {batch_index + 1}/{len(batches)} already completed, skipping.")
+            print(
+                f"BATCH {batch_index + 1}/{len(batches)} already completed, skipping."
+            )
             continue
 
-        print(f"\nBATCH {batch_index + 1}/{len(batches)}")
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                result = translate_batch(client, batch, terminology)
-                translations = result.get("translations", [])
-                print(f"Translations received: {len(translations)}")
+        print(f"BATCH {batch_index + 1}/{len(batches)}")
+        recovery = translate_batch_with_recovery(
+            client,
+            batch,
+            terminology,
+            log_func=print,
+            label=f"archive batch {batch_index + 1}/{len(batches)}",
+        )
+        translations = recovery["translations"]
+        terminology = recovery["terminology"]
 
-                validation = validate_translations(batch, translations)
-                if validation["has_error"]:
-                    print("Validation failed: " + " | ".join(validation["errors"]))
-                    if attempt < MAX_RETRIES:
-                        time.sleep(attempt * 2)
-                        continue
-                    raise RuntimeError("Batch failed validation after maximum retries.")
+        if mode == "archive":
+            changed = apply_archive_translations(data, batch, translations)
+        else:
+            changed = apply_flat_translations(data, batch, translations)
 
-                terminology = merge_terminology(terminology, result.get("newTerminology", []))
-                save_terminology(terminology)
+        if changed != len(batch):
+            raise RuntimeError(
+                f"Applied {changed}/{len(batch)} entries instead of {len(batch)}."
+            )
 
-                if mode == "archive":
-                    changed = apply_archive_translations(data, batch, translations)
-                else:
-                    changed = apply_flat_translations(data, batch, translations)
-                    
-                if changed != len(batch):
-                    raise RuntimeError(f"Applied {changed}/{len(batch)} entries.")
-
-                save_json(OUTPUT_FILE, data)
-                completed.add(batch_index)
-                save_checkpoint(completed)
-
-                print("✓ BATCH COMPLETED")
-                break
-                
-            except Exception as e:
-                err_str = str(e)
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    print("API kotası doldu (15 istek/dakika). Modül 60 saniye beklemeye alındı...")
-                    time.sleep(60)
-                    continue
-                if attempt >= MAX_RETRIES:
-                    raise
-                print(f"Attempt {attempt}/{MAX_RETRIES} failed: {e}")
-                time.sleep(attempt * 2)
-                
-        time.sleep(2)
+        save_terminology(terminology)
+        save_json(OUTPUT_FILE, data)
+        completed.add(batch_index)
+        save_checkpoint(completed, metadata)
+        print("✓ BATCH COMPLETED")
 
     print("============================================================")
     print("TRANSLATION COMPLETED")
     print("============================================================")
-    print(f"Output: {OUTPUT_FILE}\nCompleted batches: {len(completed)}/{len(batches)}")
+    print(f"Output: {OUTPUT_FILE}")
+    print(f"Completed batches: {len(completed)}/{len(batches)}")
+
 
 if __name__ == "__main__":
     main()
