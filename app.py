@@ -253,18 +253,22 @@ def discover_archives(root):
     )
 
 def path_has_localization_locale(path, source_code=SOURCE_CODE):
+    """Return True when a path contains a supported localization surface and source locale."""
     parts = [p.lower() for p in Path(path).parts]
+    source_code = source_code.lower()
 
-    if "localization" not in parts:
-        return False
+    for surface in ("localization", "onscreens"):
+        if surface not in parts:
+            continue
+        try:
+            surface_index = parts.index(surface)
+        except ValueError:
+            continue
+        after = parts[surface_index + 1:]
+        if source_code in after:
+            return True
 
-    try:
-        loc_index = parts.index("localization")
-    except ValueError:
-        return False
-
-    after = parts[loc_index + 1:]
-    return source_code.lower() in after
+    return False
 
 def discover_localization_resources(extracted_root):
     extracted_root = Path(extracted_root)
@@ -274,13 +278,17 @@ def discover_localization_resources(extracted_root):
         if not path.is_file():
             continue
 
-        candidate = False
+        lower_parts = [p.lower() for p in path.relative_to(extracted_root).parts]
+        candidate = (
+            path.name.lower() == "en-us.json"
+            or path_has_localization_locale(path, SOURCE_CODE)
+        )
 
-        if path.name.lower() == "en-us.json":
-            candidate = True
-
-        if path_has_localization_locale(path, SOURCE_CODE):
-            candidate = True
+        # ArchiveXL OnScreen resources are CR2W JsonResource files stored under
+        # <...>/onscreens/en-us/*.json. They must be serialized by WolvenKit
+        # before the existing Gemini translation pipeline can process them.
+        if "onscreens" in lower_parts:
+            candidate = candidate and SOURCE_CODE.lower() in lower_parts[lower_parts.index("onscreens") + 1:]
 
         if not candidate:
             continue
@@ -390,6 +398,9 @@ def infer_localization_category(resource, extracted_root):
                 if category:
                     return category
 
+    if "onscreens" in lower:
+        return "onscreens"
+
     return "onscreens"
 
 def generate_xl_from_resources(resources, extracted_root, target_code):
@@ -423,10 +434,12 @@ def target_path_for_resource(resource, extracted_root, target_code):
     parts = list(relative.parts)
     lower = [p.lower() for p in parts]
 
-    if "localization" in lower:
-        loc_index = lower.index("localization")
-        for i in range(loc_index + 1, len(parts)):
-            if lower[i] == SOURCE_CODE:
+    for surface in ("localization", "onscreens"):
+        if surface not in lower:
+            continue
+        surface_index = lower.index(surface)
+        for i in range(surface_index + 1, len(parts)):
+            if lower[i] == SOURCE_CODE.lower():
                 parts[i] = target_code
                 return Path(*parts)
 
@@ -666,7 +679,7 @@ def run_translation(
         # ----------------------------------------------------
         if archives:
             log_func(f"Found {len(archives)} archive file(s).")
-            log_func("Safety mode: runtime .reds/.lua/.tweak files are protected. Dedicated localization surfaces may still be processed safely.")
+            log_func("Safety mode: runtime .reds/.lua/.tweak files are protected. Dedicated localization surfaces, including ArchiveXL OnScreen resources, may still be processed safely.")
             
             for archive_index, archive_path in enumerate(archives, start=1):
                 log_func("")
@@ -694,10 +707,16 @@ def run_translation(
                 resources = discover_localization_resources(extracted_root)
 
                 if not resources:
-                    log_func("INFO: No localization CR2W resources found in this archive; archive will be copied unchanged.")
+                    log_func("INFO: No supported localization resources found in this archive; archive will be copied unchanged.")
                     continue
 
-                log_func(f"Found {len(resources)} localization resource(s).")
+                onscreen_count = sum(
+                    1 for resource in resources
+                    if "onscreens" in [p.lower() for p in resource.relative_to(extracted_root).parts]
+                )
+                log_func(f"Found {len(resources)} supported localization resource(s).")
+                if onscreen_count:
+                    log_func(f"ArchiveXL OnScreen localization detected: {onscreen_count} resource(s).")
 
                 xl_search_root = source_root if input_path.suffix.lower() == ".zip" else archive_path.parent
                 source_xl = find_source_xl(xl_search_root, archive_path, resources)
@@ -726,7 +745,11 @@ def run_translation(
                     for folder in [resource_serialized, resource_translated, resource_deserialized]:
                         folder.mkdir(parents=True, exist_ok=True)
 
-                    log_func(f"Localization {resource_counter}/{len(resources)}: {relative_source}")
+                    resource_parts_lower = [p.lower() for p in relative_source.parts]
+                    if "onscreens" in resource_parts_lower:
+                        log_func(f"OnScreen localization {resource_counter}/{len(resources)}: {relative_source}")
+                    else:
+                        log_func(f"Localization {resource_counter}/{len(resources)}: {relative_source}")
 
                     run_command(
                         [str(WOLVENKIT), "convert", "serialize", str(resource), "-o", str(resource_serialized)],

@@ -2,7 +2,6 @@ import json
 import os
 import re
 import time
-from pathlib import Path
 
 from google import genai
 from google.genai import types
@@ -64,12 +63,6 @@ def detect_json_format(data):
 # ENTRY EXTRACTION
 # ============================================================
 
-def has_translatable_visible_text(text):
-    if not isinstance(text, str) or not text.strip():
-        return False
-    masked, _ = mask_protected_text(text)
-    return bool(re.search(r"[A-Za-zÀ-ÖØ-öø-ÿĀ-žА-Яа-яΑ-ω一-龯]", masked))
-
 def extract_archive_entries(data):
     try:
         entries = data["Data"]["RootChunk"]["root"]["Data"]["entries"]
@@ -86,8 +79,6 @@ def extract_archive_entries(data):
         secondary_key = entry.get("secondaryKey", "")
         
         if not female and not male:
-            continue
-        if female and not has_translatable_visible_text(female) and male and not has_translatable_visible_text(male):
             continue
             
         result.append({
@@ -119,163 +110,35 @@ def create_batches(entries, batch_size):
     return [entries[i:i + batch_size] for i in range(0, len(entries), batch_size)]
 
 # ============================================================
-# PLACEHOLDERS / TAGS / PROTECTED TEXT
+# PLACEHOLDERS / TAGS
 # ============================================================
-
-SPECIAL_TOKEN_PATTERNS = [
-    re.compile(r"<[^>]+>"),
-    re.compile(r"\{\{[^}]+\}\}"),
-    re.compile(r"\{[^}]+\}"),
-    re.compile(r"%[^%]+%"),
-    re.compile(r"\[[/?A-Za-z*][^\]]*\]"),
-    re.compile(r"\\[nrt]"),
-]
-
 
 def extract_special_tokens(text):
     if not text:
         return []
-
+    patterns = [r"<[^>]+>", r"\{[^}]+\}", r"%[^%]+%", r"\\[nrt]"]
     tokens = []
-    for pattern in SPECIAL_TOKEN_PATTERNS:
-        tokens.extend(pattern.findall(text))
-
-    # Parsed JSON strings contain real newline/tab characters, not the two-byte
-    # sequences \\n / \\t. Preserve those too.
-    tokens.extend(["\\n"] * text.count("\n"))
-    tokens.extend(["\\r"] * text.count("\r"))
-    tokens.extend(["\\t"] * text.count("\t"))
+    for pattern in patterns:
+        tokens.extend(re.findall(pattern, text))
     return tokens
 
-
-def describe_special_token_mismatch(source, translated):
-    source_tokens = extract_special_tokens(source)
-    translated_tokens = extract_special_tokens(translated)
-    if sorted(source_tokens) == sorted(translated_tokens):
-        return None
-
-    from collections import Counter
-    src = Counter(source_tokens)
-    dst = Counter(translated_tokens)
-    missing = list((src - dst).elements())
-    extra = list((dst - src).elements())
-    details = []
-    if missing:
-        details.append(f"Missing token(s): {missing}")
-    if extra:
-        details.append(f"Unexpected token(s): {extra}")
-    return "; ".join(details) or "Protected token structure changed."
-
-
 def validate_special_tokens(source, translated):
-    return describe_special_token_mismatch(source, translated) is None
-
+    return sorted(extract_special_tokens(source)) == sorted(extract_special_tokens(translated))
 
 def validate_translation_fields(source, translated):
     if source and not translated:
         return False
     return validate_special_tokens(source, translated)
 
-
-def mask_protected_text(text):
-    """Replace formatting, complete [code] blocks, placeholders and escapes with exact tokens."""
-    if not text:
-        return text, {}
-
-    protected = {}
-    masked = text
-    counter = 0
-
-    def replacement(match):
-        nonlocal counter
-        token = f"<CYPROTECTED_{counter:04d}>"
-        counter += 1
-        protected[token] = match.group(0)
-        return token
-
-    # Protect an entire code block, including its contents, before handling individual tags.
-    masked = re.sub(
-        r"\[code\b[^\]]*\].*?\[/code\]",
-        replacement,
-        masked,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-
-    # Protect remaining placeholders, tags and escaped control sequences.
-    combined = re.compile(
-        r"<(?!CYPROTECTED_\d{4}>)[^>]+>|\{\{[^}]+\}\}|\{[^}]+\}|%[^%]+%|\[[/?A-Za-z*][^\]]*\]|\\[nrt]",
-        re.DOTALL,
-    )
-    masked = combined.sub(replacement, masked)
-
-    # JSON parsing turns escaped controls into real characters.
-    for char in ("\r\n", "\n", "\r", "\t"):
-        while char in masked:
-            token = f"<CYPROTECTED_{counter:04d}>"
-            counter += 1
-            masked = masked.replace(char, token, 1)
-            protected[token] = char
-
-    return masked, protected
-
-
-def restore_protected_text(text, protected):
-    if not protected:
-        return text
-
-    restored = text
-    for token, original in protected.items():
-        count = restored.count(token)
-        if count != 1:
-            if count == 0:
-                raise RuntimeError(f"Protected token missing from Gemini response: {token}")
-            raise RuntimeError(f"Protected token duplicated in Gemini response: {token} ({count} occurrences)")
-        restored = restored.replace(token, original, 1)
-    return restored
-
-
-def _mask_batch_text_fields(batch):
-    masked_batch = []
-    protected_by_key = {}
-
-    for item in batch:
-        copy_item = dict(item)
-        index = item["index"]
-        for field in ("female", "male"):
-            value = item.get(field, "")
-            if value:
-                masked, protected = mask_protected_text(value)
-                copy_item[field] = masked
-                protected_by_key[(index, field)] = protected
-            else:
-                protected_by_key[(index, field)] = {}
-        masked_batch.append(copy_item)
-
-    return masked_batch, protected_by_key
-
-
-def _restore_batch_text_fields(result, protected_by_key):
-    restored = json.loads(json.dumps(result, ensure_ascii=False))
-    for item in restored.get("translations", []):
-        index = item.get("index")
-        for field in ("female", "male"):
-            value = item.get(field, "")
-            protected = protected_by_key.get((index, field), {})
-            if value and protected:
-                item[field] = restore_protected_text(value, protected)
-    return restored
-
-
 def validate_translations(batch, translations):
     expected_set = {item["index"] for item in batch}
     received_set = {item.get("index") for item in translations}
-
+    
     errors = []
     missing = expected_set - received_set
     extra = received_set - expected_set
-    index_list = [item.get("index") for item in translations]
-    duplicate = {i for i in set(index_list) if index_list.count(i) > 1}
-
+    duplicate = {i for i in set(item.get("index") for item in translations) if [t.get("index") for t in translations].count(i) > 1}
+    
     if missing:
         errors.append(f"Missing indices: {sorted(missing)}")
     if extra:
@@ -288,37 +151,28 @@ def validate_translations(batch, translations):
         index = item.get("index")
         if index not in original_by_index:
             continue
-
+            
         source = original_by_index[index]
         if item.get("secondaryKey", "") != source["secondaryKey"]:
             errors.append(f"secondaryKey mismatch at index {index}")
-
-        source_female = source.get("female", "")
-        target_female = item.get("female", "")
-        if not validate_translation_fields(source_female, target_female):
-            detail = describe_special_token_mismatch(source_female, target_female)
-            if detail:
-                errors.append(f"Female translation validation failed at index {index}: {detail}")
-            else:
-                errors.append(f"Female translation validation failed at index {index}: empty target")
-
+            
+        if not validate_translation_fields(source.get("female", ""), item.get("female", "")):
+            errors.append(f"Female translation validation failed at index {index}")
+            
         source_male = source.get("male", "")
         target_male = item.get("male", "")
+        
         if not source_male and target_male:
             errors.append(f"Male field unexpectedly populated at index {index}")
         elif source_male and not validate_translation_fields(source_male, target_male):
-            detail = describe_special_token_mismatch(source_male, target_male)
-            if detail:
-                errors.append(f"Male translation validation failed at index {index}: {detail}")
-            else:
-                errors.append(f"Male translation validation failed at index {index}: empty target")
+            errors.append(f"Male translation validation failed at index {index}")
 
     return {
-        "has_error": bool(errors),
-        "errors": errors,
-        "missing_indices": missing,
-        "extra_indices": extra,
-        "duplicate_indices": duplicate,
+        "has_error": bool(errors), 
+        "errors": errors, 
+        "missing_indices": missing, 
+        "extra_indices": extra, 
+        "duplicate_indices": duplicate
     }
 
 # ============================================================
@@ -388,14 +242,12 @@ def save_checkpoint(completed_batches):
 # ============================================================
 
 def translate_batch(client, batch, terminology):
-    masked_batch, protected_by_key = _mask_batch_text_fields(batch)
     payload = [
         {
             "index": item["index"],
-            "secondaryKey": item["secondaryKey"],
             "female": item["female"],
             "male": item["male"]
-        } for item in masked_batch
+        } for item in batch
     ]
     
     prompt = f"""
@@ -405,16 +257,15 @@ Translate English user-visible text into {TARGET_LANGUAGE}.
 STRICT RULES:
 1. Return every supplied index exactly once.
 2. Never change index.
-3. Never change secondaryKey.
+3. Return only translation fields; do not invent or modify internal metadata.
 4. Translate only female and male.
 5. If source male is empty, target male must stay empty.
 6. Ordinary UI labels must not remain in English. Examples: Settings, Enable, Disable, Save, Cancel, Continue, Close, General, Speed.
 7. Preserve proper nouns and established Cyberpunk terminology where natural.
-8. Protected tokens such as <CYPROTECTED_0000> are machine-generated immutable placeholders. Copy them exactly, character-for-character; never translate, remove, duplicate, split, or rename them.
-9. Preserve any remaining placeholders, tags, variables, escape sequences, and BBCode.
-10. If a source sentence is ordinary user-visible text, do not simply repeat the English source unchanged unless it is a proper noun, established term, or genuinely language-neutral text.
-11. If secondaryKey looks like an internal identifier, keep it unchanged.
-12. Use natural, idiomatic {TARGET_LANGUAGE}, not literal English word order.
+8. Preserve ALL placeholders, tags, variables, escape sequences, and BBCode (like [b], [color=...], [list], [*], [i]).
+9. DO NOT translate any code or technical text inside [code]...[/code] blocks.
+10. Use natural, idiomatic {TARGET_LANGUAGE}, not literal English word order.
+11. If a source sentence is ordinary user-visible text, do not simply repeat the English source unchanged.
 
 TERMINOLOGY FOR {TARGET_LANGUAGE}:
 {json.dumps(terminology, ensure_ascii=False, indent=2)}
@@ -427,7 +278,6 @@ Return ONLY JSON in this schema:
   "translations": [
     {{
       "index": 0,
-      "secondaryKey": "...",
       "female": "...",
       "male": "..."
     }}
@@ -455,11 +305,10 @@ Return ONLY JSON in this schema:
                             "type": "object",
                             "properties": {
                                 "index": {"type": "integer"},
-                                "secondaryKey": {"type": "string"},
                                 "female": {"type": "string"},
                                 "male": {"type": "string"},
                             },
-                            "required": ["index", "secondaryKey", "female", "male"],
+                            "required": ["index", "female", "male"],
                         },
                     },
                     "newTerminology": {
@@ -483,10 +332,21 @@ Return ONLY JSON in this schema:
         raise RuntimeError("Gemini returned an empty response.")
 
     result = json.loads(response.text)
-    try:
-        return _restore_batch_text_fields(result, protected_by_key)
-    except Exception as e:
-        raise RuntimeError(f"Protected localization token restoration failed: {e}") from e
+
+    # secondaryKey is immutable source metadata. It is keyed by index and
+    # must never depend on model output. Reattach it from the original batch
+    # before validation/application so a model typo cannot invalidate an
+    # otherwise correct translation batch.
+    original_by_index = {item["index"]: item for item in batch}
+    for item in result.get("translations", []):
+        if not isinstance(item, dict):
+            continue
+        index = item.get("index")
+        source = original_by_index.get(index)
+        if source is not None:
+            item["secondaryKey"] = source["secondaryKey"]
+
+    return result
 
 # ============================================================
 # APPLY TRANSLATIONS
@@ -628,7 +488,7 @@ def translate_code_file(client, filepath, terminology, log_func=None):
             err_str = str(e)
             if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                 if log_func:
-                    log_func("API rate limit reached (15 requests/minute). Waiting 60 seconds before retrying...")
+                    log_func("API kotası doldu (15 istek/dakika). Modül 60 saniye beklemeye alındı...")
                 time.sleep(60)
                 continue
             if attempt >= MAX_RETRIES:
@@ -638,314 +498,6 @@ def translate_code_file(client, filepath, terminology, log_func=None):
             time.sleep(attempt * 2)
             
     return False
-
-# ============================================================
-# SELECTIVE LUA LOCALIZATION
-# ============================================================
-
-LUA_NATIVE_SETTINGS_METHODS = {
-    "addTab",
-    "addSubcategory",
-    "addSwitch",
-    "addSelectorString",
-    "addRangeFloat",
-    "addRangeInt",
-    "addSlider",
-    "addButton",
-    "addCheckbox",
-    "addKeybind",
-    "addColor",
-    "addColorPicker",
-}
-
-LUA_NATIVE_CALL_RE = re.compile(
-    r"\bnativeSettings\.(add[A-Za-z0-9_]+)\s*\(",
-    re.MULTILINE,
-)
-LUA_LOCALIZATION_TABLE_RE = re.compile(
-    r"(?m)^\s*(?:local\s+)?(?:loc|localization|translations|strings)\s*=\s*\{"
-)
-LUA_STRING_RE = re.compile(
-    r"\"([^\"\\]*(?:\\.[^\"\\]*)*)\"|'([^'\\]*(?:\\.[^'\\]*)*)'"
-)
-
-
-def _lua_scan_balanced(text, opening_index, opening_char="(", closing_char=")"):
-    if opening_index < 0 or opening_index >= len(text) or text[opening_index] != opening_char:
-        return None, None
-    depth = 0
-    quote = None
-    escape = False
-    comment = False
-    i = opening_index
-    while i < len(text):
-        ch = text[i]
-        nxt = text[i + 1] if i + 1 < len(text) else ""
-        if comment:
-            if ch == "\n":
-                comment = False
-            i += 1
-            continue
-        if quote is None and ch == "-" and nxt == "-":
-            comment = True
-            i += 2
-            continue
-        if quote is not None:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == quote:
-                quote = None
-            i += 1
-            continue
-        if ch in ("'", '"'):
-            quote = ch
-        elif ch == opening_char:
-            depth += 1
-        elif ch == closing_char:
-            depth -= 1
-            if depth == 0:
-                return text[opening_index + 1:i], i
-        i += 1
-    return None, None
-
-
-def _lua_split_args(text):
-    parts = []
-    start = 0
-    depth = 0
-    quote = None
-    escape = False
-    comment = False
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        nxt = text[i + 1] if i + 1 < len(text) else ""
-        if comment:
-            if ch == "\n":
-                comment = False
-            i += 1
-            continue
-        if quote is not None:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == quote:
-                quote = None
-            i += 1
-            continue
-        if ch in ("'", '"'):
-            quote = ch
-        elif ch == "-" and nxt == "-":
-            comment = True
-            i += 2
-            continue
-        elif ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            depth = max(0, depth - 1)
-        elif ch == "," and depth == 0:
-            parts.append((text[start:i], start, i))
-            start = i + 1
-        i += 1
-    parts.append((text[start:], start, len(text)))
-    return parts
-
-
-def _lua_decode(raw):
-    if raw.startswith('"'):
-        try:
-            return json.loads(raw)
-        except Exception:
-            return raw[1:-1]
-    return raw[1:-1]
-
-
-def _lua_literals(text, absolute_offset=0):
-    result = []
-    for match in LUA_STRING_RE.finditer(text):
-        raw = match.group(0)
-        value = _lua_decode(raw)
-        group_index = 1 if match.group(1) is not None else 2
-        value_start = absolute_offset + match.start(group_index)
-        value_end = absolute_offset + match.end(group_index)
-        result.append({
-            "value": value,
-            "start": value_start,
-            "end": value_end,
-            "quote_start": absolute_offset + match.start(),
-            "quote_end": absolute_offset + match.end(),
-        })
-    return result
-
-
-def _lua_native_entries(content):
-    entries = []
-    option_vars = set()
-    for match in LUA_NATIVE_CALL_RE.finditer(content):
-        method = match.group(1)
-        if method not in LUA_NATIVE_SETTINGS_METHODS:
-            continue
-        opening = content.find("(", match.start(), match.end())
-        args_text, _ = _lua_scan_balanced(content, opening, "(", ")")
-        if args_text is None:
-            continue
-        args = _lua_split_args(args_text)
-        positions = [1] if method in {"addTab", "addSubcategory"} else [1, 2]
-        for position in positions:
-            if position >= len(args):
-                continue
-            raw_arg, relative_start, _ = args[position]
-            for literal in _lua_literals(raw_arg, opening + 1 + relative_start):
-                if literal["value"].strip():
-                    literal["source"] = f"nativeSettings.{method}"
-                    entries.append(literal)
-                    break
-        if method == "addSelectorString" and len(args) >= 4:
-            candidate = args[3][0].strip()
-            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", candidate):
-                option_vars.add(candidate)
-    for var_name in option_vars:
-        match = re.search(
-            rf"(?m)^\s*(?:local\s+)?{re.escape(var_name)}\s*=\s*\{{",
-            content,
-        )
-        if not match:
-            continue
-        opening = content.find("{", match.start(), match.end())
-        body, _ = _lua_scan_balanced(content, opening, "{", "}")
-        if body is None:
-            continue
-        for literal in _lua_literals(body, opening + 1):
-            if literal["value"].strip():
-                literal["source"] = f"option array {var_name}"
-                entries.append(literal)
-    return entries
-
-
-def _lua_loc_table_entries(content):
-    entries = []
-    for match in LUA_LOCALIZATION_TABLE_RE.finditer(content):
-        opening = content.find("{", match.start(), match.end())
-        body, _ = _lua_scan_balanced(content, opening, "{", "}")
-        if body is None:
-            continue
-        for literal in _lua_literals(body, opening + 1):
-            if literal["value"].strip():
-                literal["source"] = "localization table"
-                entries.append(literal)
-    return entries
-
-
-def extract_lua_localization_entries(content):
-    candidates = _lua_native_entries(content) + _lua_loc_table_entries(content)
-    candidates.sort(key=lambda item: item["start"])
-    result = []
-    seen = set()
-    for item in candidates:
-        span = (item["quote_start"], item["quote_end"])
-        if span in seen:
-            continue
-        seen.add(span)
-        value = item["value"]
-        if len(value.strip()) <= 1:
-            continue
-        if re.match(r"^https?://", value.strip(), re.IGNORECASE):
-            continue
-        if value.strip().startswith("/"):
-            continue
-        if re.fullmatch(r"[%dioxXfFeEgGst]+", value.strip()):
-            continue
-        result.append(item)
-    return result
-
-
-def is_lua_localization_file(filepath):
-    try:
-        content = Path(filepath).read_text(encoding="utf-8")
-    except Exception:
-        return False
-    return bool("nativeSettings.add" in content or LUA_LOCALIZATION_TABLE_RE.search(content))
-
-
-def translate_lua_localization_file(client, filepath, terminology, log_func=None):
-    path = Path(filepath)
-    content = path.read_text(encoding="utf-8")
-    entries = extract_lua_localization_entries(content)
-    if not entries:
-        return False
-
-    if log_func:
-        log_func(f"Translating Lua localization: {path.name}")
-        log_func(f"  -> Localizable strings found: {len(entries)}")
-
-    batch = [
-        {
-            "index": i,
-            "secondaryKey": f"{path.name}:{i}",
-            "female": item["value"],
-            "male": "",
-        }
-        for i, item in enumerate(entries)
-    ]
-
-    translations_by_index = {}
-    for batch_number, group in enumerate(create_batches(batch, BATCH_SIZE), start=1):
-        success = False
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                if log_func:
-                    log_func(
-                        f"  -> Gemini response pending (Attempt {attempt}/{MAX_RETRIES}) - "
-                        f"Lua batch {batch_number}..."
-                    )
-                result = translate_batch(client, group, terminology)
-                translations = result.get("translations", [])
-                validation = validate_translations(group, translations)
-                if validation["has_error"]:
-                    raise RuntimeError(
-                        "Lua localization validation failed: "
-                        + " | ".join(validation["errors"])
-                    )
-                terminology = merge_terminology(terminology, result.get("newTerminology", []))
-                save_terminology(terminology)
-                for item in translations:
-                    translations_by_index[item["index"]] = item
-                success = True
-                break
-            except Exception as e:
-                err = str(e)
-                if "429" in err or "RESOURCE_EXHAUSTED" in err:
-                    if log_func:
-                        log_func("  -> API rate limit reached; waiting 60 seconds...")
-                    time.sleep(60)
-                    continue
-                if attempt >= MAX_RETRIES:
-                    raise
-                time.sleep(attempt * 2)
-        if not success:
-            raise RuntimeError(f"Lua localization batch {batch_number} failed.")
-
-    replacements = []
-    for index, source_entry in enumerate(entries):
-        translated = translations_by_index.get(index)
-        if translated is None:
-            raise RuntimeError(f"Missing Lua localization translation at index {index}.")
-        target = translated.get("female", "")
-        if not validate_translation_fields(source_entry["value"], target):
-            raise RuntimeError(f"Invalid Lua localization translation at index {index}.")
-        replacements.append((source_entry["start"], source_entry["end"], target))
-
-    for start, end, replacement in reversed(replacements):
-        content = content[:start] + replacement + content[end:]
-
-    path.write_text(content, encoding="utf-8")
-    if log_func:
-        log_func(f"  -> Lua localization saved: {path.name}")
-        log_func("  -> Operation completed.")
-    return True
 
 # ============================================================
 # REDSCRIPT CONFIG FRAMEWORK (JSON & TXT)
@@ -977,7 +529,7 @@ def translate_redscript_config_file(client, filepath, terminology, log_func=None
         return False
 
     if log_func:
-        log_func(f"  -> Localizable strings found: {len(strings)}")
+        log_func(f"  -> Bulunan metin sayısı: {len(strings)}")
 
     batch = [
         {
@@ -991,7 +543,7 @@ def translate_redscript_config_file(client, filepath, terminology, log_func=None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             if log_func:
-                log_func(f"  -> Waiting for Gemini API response (attempt {attempt})...")
+                log_func(f"  -> Gemini API'den yanıt bekleniyor (Deneme {attempt})...")
 
             result = translate_batch(client, batch, terminology)
             translations = result.get("translations", [])
@@ -1001,7 +553,7 @@ def translate_redscript_config_file(client, filepath, terminology, log_func=None
                 raise RuntimeError("Config JSON Validation failed.")
 
             if log_func:
-                log_func("  -> Translation successful. Writing changes...")
+                log_func("  -> Çeviri başarılı, dosyaya yazılıyor...")
 
             by_index = {item["index"]: item for item in translations}
             
@@ -1022,14 +574,14 @@ def translate_redscript_config_file(client, filepath, terminology, log_func=None
                 json.dump(data, f, ensure_ascii=False, indent=2)
             
             if log_func:
-                log_func("  -> Operation completed.")
+                log_func("  -> İşlem tamamlandı.")
             return True
             
         except Exception as e:
             err_str = str(e)
             if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                 if log_func:
-                    log_func("API rate limit reached (15 requests/minute). Waiting 60 seconds before retrying...")
+                    log_func("API kotası doldu (15 istek/dakika). Modül 60 saniye beklemeye alındı...")
                 time.sleep(60)
                 continue
             if attempt >= MAX_RETRIES:
@@ -1052,7 +604,7 @@ def translate_bbcode_txt_file(client, filepath, terminology, log_func=None):
         return False
 
     if log_func:
-        log_func(f"  -> Paragraphs found: {len(paragraphs)}")
+        log_func(f"  -> Bulunan paragraf sayısı: {len(paragraphs)}")
 
     batch = [
         {
@@ -1066,7 +618,7 @@ def translate_bbcode_txt_file(client, filepath, terminology, log_func=None):
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             if log_func:
-                log_func(f"  -> Waiting for Gemini API response (attempt {attempt}). This may take a while...")
+                log_func(f"  -> Gemini API'den yanıt bekleniyor (Deneme {attempt}). Bu uzun sürebilir...")
 
             result = translate_batch(client, batch, terminology)
             translations = result.get("translations", [])
@@ -1076,7 +628,7 @@ def translate_bbcode_txt_file(client, filepath, terminology, log_func=None):
                 raise RuntimeError("BBCode TXT Validation failed.")
 
             if log_func:
-                log_func("  -> Translation successful. Writing changes...")
+                log_func("  -> Çeviri başarılı, dosyaya yazılıyor...")
 
             by_index = {item["index"]: item for item in translations}
             
@@ -1088,14 +640,14 @@ def translate_bbcode_txt_file(client, filepath, terminology, log_func=None):
                 f.write(content)
             
             if log_func:
-                log_func("  -> Operation completed.")
+                log_func("  -> İşlem tamamlandı.")
             return True
             
         except Exception as e:
             err_str = str(e)
             if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                 if log_func:
-                    log_func("API rate limit reached (15 requests/minute). Waiting 60 seconds before retrying...")
+                    log_func("API kotası doldu (15 istek/dakika). Modül 60 saniye beklemeye alındı...")
                 time.sleep(60)
                 continue
             if attempt >= MAX_RETRIES:
@@ -1194,7 +746,7 @@ def translate_codeware_package(client, filepath, output_filepath, terminology, t
                 err_str = str(e)
                 if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
                     if log_func:
-                        log_func("API rate limit reached (15 requests/minute). Waiting 60 seconds before retrying...")
+                        log_func("API kotası doldu (15 istek/dakika). Modül 60 saniye beklemeye alındı...")
                     time.sleep(60)
                     continue
                 if attempt >= MAX_RETRIES:
@@ -1339,7 +891,7 @@ def main():
             except Exception as e:
                 err_str = str(e)
                 if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
-                    print("API rate limit reached (15 requests/minute). Waiting 60 seconds before retrying...")
+                    print("API kotası doldu (15 istek/dakika). Modül 60 saniye beklemeye alındı...")
                     time.sleep(60)
                     continue
                 if attempt >= MAX_RETRIES:
